@@ -1,12 +1,13 @@
 import asyncio
 import base64
 import csv
+import difflib
 import io
 import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import aiosqlite
 import httpx
@@ -163,6 +164,22 @@ async def init_db() -> None:
                 sold_at        TEXT   DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # ── Card name cache (fitur autocomplete & /gen) ────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS card_cache (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT    NOT NULL,
+                card_set   TEXT,
+                set_series TEXT,
+                set_id     TEXT,
+                price_usd  REAL    DEFAULT 0.0,
+                release_date TEXT,
+                updated_at TEXT    DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_card_cache_name ON card_cache(LOWER(name))")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_card_cache_series ON card_cache(set_series)")
 
         await db.commit()
 
