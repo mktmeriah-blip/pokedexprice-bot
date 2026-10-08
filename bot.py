@@ -31,6 +31,13 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
+try:
+    import pytesseract
+    from PIL import ImageFilter, ImageEnhance
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
+
 load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 logging.basicConfig(
@@ -835,16 +842,159 @@ async def handle_manual_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
         context.bot_data.pop(key, None)
     await query.message.reply_text("❌ Dibatalkan\\.", parse_mode="MarkdownV2")
 
+# ── OCR: baca nama kartu dari foto label PSA ─────────────────────────────────
+def ocr_card_label(photo_bytes: bytes) -> str | None:
+    """Baca nama kartu dari foto PSA/label pakai Tesseract OCR."""
+    if not HAS_TESSERACT:
+        return None
+    try:
+        image = Image.open(io.BytesIO(photo_bytes))
+        w, h  = image.size
+
+        # Crop area label: ambil 40% atas, 72% kiri (hindari kolom grade kanan)
+        label = image.crop((0, 0, int(w * 0.72), int(h * 0.42)))
+
+        # Upscale 2x supaya OCR lebih akurat
+        label = label.resize((label.width * 2, label.height * 2), Image.LANCZOS)
+
+        # Grayscale + sharpen + contrast
+        label = label.convert("L")
+        label = label.filter(ImageFilter.SHARPEN)
+        label = ImageEnhance.Contrast(label).enhance(2.5)
+
+        raw = pytesseract.image_to_string(label, config="--psm 6 --oem 3")
+        lines = [l.strip() for l in raw.strip().splitlines() if len(l.strip()) >= 3]
+
+        if not lines:
+            return None
+
+        # Cari baris "POKEMON" → baris berikutnya adalah nama kartu
+        for i, line in enumerate(lines):
+            if "POKEMON" in line.upper() or "POKÉMON" in line.upper():
+                name_parts = []
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    nl = lines[j].strip()
+                    # Skip baris yang isinya angka saja (cert number, grade)
+                    if re.sub(r"[^a-zA-Z]", "", nl) and len(nl) >= 3:
+                        # Skip kata meta-grade
+                        skip = {"GEM", "MT", "NM", "PSA", "AUTHENTIC", "MINT"}
+                        words = nl.upper().split()
+                        if not all(w in skip for w in words):
+                            name_parts.append(nl.strip())
+                if name_parts:
+                    return " ".join(name_parts).title()
+
+        # Fallback: baris non-angka pertama
+        for line in lines:
+            if re.sub(r"[^a-zA-Z]", "", line) and not re.match(r"^[\d\s#]+$", line):
+                return line.title()
+
+        return None
+    except Exception as e:
+        logger.warning(f"OCR error: {e}")
+        return None
+
+# ── Callback OCR: pakai nama terdeteksi ──────────────────────────────────────
+async def handle_ocr_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    name    = context.bot_data.pop(f"pending_ocr_name_{user_id}", None)
+    if not name:
+        await query.message.reply_text("⚠️ Data expired, kirim foto lagi bre\\.", parse_mode="MarkdownV2")
+        return
+    await query.message.reply_text(
+        f"🔍 Mencari *{esc(name)}*\\.\\.\\.", parse_mode="MarkdownV2"
+    )
+    results = await search_pokemon_cards_multi(name, limit=5)
+    not_found = not results or (isinstance(results, list) and len(results) == 0)
+    has_error = isinstance(results, dict) and results.get("error")
+    if has_error or not_found:
+        context.bot_data[f"pending_manual_name_{user_id}"] = name
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💾 Simpan Manual (isi harga sendiri)", callback_data=f"manual_save:{user_id}")],
+            [InlineKeyboardButton("🔍 Coba nama lain", callback_data=f"manual_retry:{user_id}")],
+        ])
+        await query.message.reply_text(
+            f"❌ *{esc(name)}* tidak ditemukan di database\\.\n\nMau simpan manual?",
+            reply_markup=keyboard,
+            parse_mode="MarkdownV2",
+        )
+    elif len(results) == 1:
+        await send_card(
+            update, results[0], context=context, show_save_buttons=True
+        )
+    else:
+        keyboard = []
+        for i, card in enumerate(results):
+            price_str = f"${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+            keyboard.append([InlineKeyboardButton(
+                f"{card['name']} ({card['set']}) — {price_str}",
+                callback_data=f"card_select:{i}:{user_id}",
+            )])
+        context.bot_data[f"search_{user_id}"] = results
+        await query.message.reply_text(
+            f"🃏 Ditemukan *{len(results)} kartu* untuk *{esc(name)}*\\:\n_Pilih yang sesuai:_",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="MarkdownV2",
+        )
+
+async def handle_ocr_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    context.bot_data.pop(f"pending_ocr_name_{user_id}", None)
+    context.bot_data[f"pending_photo_name_{user_id}"] = True
+    await query.message.reply_text(
+        "📝 Ketik nama kartunya bre:",
+        parse_mode="MarkdownV2",
+    )
+
 # ── Handler foto ─────────────────────────────────────────────────────────────
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    context.bot_data[f"pending_photo_name_{user_id}"] = True
-    await update.message.reply_text(
-        "📸 Foto diterima\\!\n\n"
-        "📝 *Ketik nama kartunya bre*, nanti bot cari harga otomatis\\!\n"
-        "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
-        parse_mode="MarkdownV2",
-    )
+
+    if HAS_TESSERACT:
+        status = await update.message.reply_text(
+            "📸 Foto diterima\\! Sedang baca nama kartu\\.\\.\\.",
+            parse_mode="MarkdownV2",
+        )
+        try:
+            photo_file  = await update.message.photo[-1].get_file()
+            photo_bytes = bytes(await photo_file.download_as_bytearray())
+            detected    = ocr_card_label(photo_bytes)
+        except Exception as e:
+            logger.error(f"Photo download error: {e}")
+            detected = None
+
+        if detected:
+            context.bot_data[f"pending_ocr_name_{user_id}"] = detected
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Pakai: {detected}", callback_data=f"ocr_use:{user_id}")],
+                [InlineKeyboardButton("✏️ Ketik nama sendiri",   callback_data=f"ocr_manual:{user_id}")],
+            ])
+            await status.edit_text(
+                f"🔍 Terdeteksi: *{esc(detected)}*\n\nPakai nama ini?",
+                reply_markup=keyboard,
+                parse_mode="MarkdownV2",
+            )
+        else:
+            context.bot_data[f"pending_photo_name_{user_id}"] = True
+            await status.edit_text(
+                "📸 Foto diterima\\!\n\n"
+                "📝 *Ketik nama kartunya bre*, nanti bot cari harga otomatis\\!\n"
+                "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
+                parse_mode="MarkdownV2",
+            )
+    else:
+        # Tesseract tidak terinstall → fallback manual
+        context.bot_data[f"pending_photo_name_{user_id}"] = True
+        await update.message.reply_text(
+            "📸 Foto diterima\\!\n\n"
+            "📝 *Ketik nama kartunya bre*, nanti bot cari harga otomatis\\!\n"
+            "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
+            parse_mode="MarkdownV2",
+        )
 
 # ── Handler teks ──────────────────────────────────────────────────────────────
 async def handle_card_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3591,6 +3741,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_manual_editnama,  pattern=r"^manual_editnama:"))
     app.add_handler(CallbackQueryHandler(handle_manual_editharga, pattern=r"^manual_editharga:"))
     app.add_handler(CallbackQueryHandler(handle_manual_cancel,    pattern=r"^manual_cancel:"))
+    app.add_handler(CallbackQueryHandler(handle_ocr_use,          pattern=r"^ocr_use:"))
+    app.add_handler(CallbackQueryHandler(handle_ocr_manual,       pattern=r"^ocr_manual:"))
     app.add_handler(MessageHandler(filters.PHOTO,                      handle_photo_search))
     app.add_handler(MessageHandler(filters.Document.ALL,               handle_csv_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,    handle_card_search_v4))
