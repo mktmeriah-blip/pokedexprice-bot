@@ -40,11 +40,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-EXCHANGE_RATE      = int(os.getenv("EXCHANGE_RATE", 16000))
-DB_PATH            = os.getenv("DB_PATH", "pokemon_inventory.db")
-OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-11b-vision-instruct:free")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN")
+EXCHANGE_RATE       = int(os.getenv("EXCHANGE_RATE", 16000))
+DB_PATH             = os.getenv("DB_PATH", "pokemon_inventory.db")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-11b-vision-instruct:free")
+POKEMON_TCG_API_KEY = os.getenv("POKEMON_TCG_API_KEY", "")
 
 if not OPENROUTER_API_KEY or not TELEGRAM_TOKEN:
     raise RuntimeError("OPENROUTER_API_KEY dan TELEGRAM_TOKEN wajib diisi di .env!")
@@ -151,6 +152,13 @@ async def get_user_lang(user_id: int) -> str:
             row = await cur.fetchone()
     return row[0] if row else "id"
 
+# ── Pokemon TCG API — helper: build headers ───────────────────────────────────
+def _tcg_headers() -> dict:
+    headers = {}
+    if POKEMON_TCG_API_KEY:
+        headers["X-Api-Key"] = POKEMON_TCG_API_KEY
+    return headers
+
 # ── Pokemon TCG API — single best match ───────────────────────────────────────
 async def search_pokemon_card(card_name: str) -> dict | None:
     clean  = card_name.strip()
@@ -159,7 +167,7 @@ async def search_pokemon_card(card_name: str) -> dict | None:
 
     try:
         async with httpx.AsyncClient(timeout=15) as http:
-            r = await http.get(url)
+            r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
             r.raise_for_status()
@@ -192,7 +200,7 @@ async def search_pokemon_cards_multi(card_name: str, limit: int = 5) -> list | d
 
     try:
         async with httpx.AsyncClient(timeout=15) as http:
-            r = await http.get(url)
+            r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
             r.raise_for_status()
@@ -213,7 +221,7 @@ async def search_pokemon_set(set_name: str, limit: int = 100) -> dict | None:
     url = f"https://api.pokemontcg.io/v2/cards?q=set.name:*{set_name}*&pageSize={limit}"
     try:
         async with httpx.AsyncClient(timeout=30) as http:
-            r = await http.get(url)
+            r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
             r.raise_for_status()
@@ -237,7 +245,7 @@ async def search_all_versions(card_name: str) -> list | dict | None:
     url   = f"https://api.pokemontcg.io/v2/cards?q=name:{clean}&pageSize=50"
     try:
         async with httpx.AsyncClient(timeout=20) as http:
-            r = await http.get(url)
+            r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
             r.raise_for_status()
@@ -601,18 +609,27 @@ async def handle_card_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     card = cards[idx]
     await query.edit_message_text(f"✅ Kamu pilih: *{esc(card['name'])}*", parse_mode="MarkdownV2")
 
-    msg = card_message(card)
+    msg   = card_message(card)
+    plain = (
+        f"✨ {card['name']}\nSet: {card['set']}\nRarity: {card['rarity']}\n"
+        f"Harga: ${card['price_usd']:.2f} | Rp {card['price_idr']:,.0f}\n"
+        f"Mau simpan? Ketik: /add {card['name']}"
+    )
     try:
         if card.get("image"):
             await query.message.reply_photo(photo=card["image"], caption=msg, parse_mode="MarkdownV2")
         else:
             await query.message.reply_text(msg, parse_mode="MarkdownV2")
     except Exception as e:
-        logger.error(f"MarkdownV2 error: {e}")
-        await query.message.reply_text(
-            f"✨ {card['name']}\nSet: {card['set']}\nRarity: {card['rarity']}\n"
-            f"Harga: ${card['price_usd']:.2f} | Rp {card['price_idr']:,.0f}"
-        )
+        logger.error(f"MarkdownV2 error, trying plain fallback: {e}")
+        try:
+            if card.get("image"):
+                await query.message.reply_photo(photo=card["image"], caption=plain)
+            else:
+                await query.message.reply_text(plain)
+        except Exception as e2:
+            logger.error(f"Photo fallback also failed: {e2}")
+            await query.message.reply_text(plain)
 
 # ── /add ──────────────────────────────────────────────────────────────────────
 async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
