@@ -181,6 +181,21 @@ async def init_db() -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_card_cache_name ON card_cache(LOWER(name))")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_card_cache_series ON card_cache(set_series)")
 
+        # ── Portfolio value snapshot (fitur /portohistory) ─────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                total_usd  REAL    DEFAULT 0.0,
+                total_idr  REAL    DEFAULT 0.0,
+                card_count INTEGER DEFAULT 0,
+                snapped_at TEXT    DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snap_user ON portfolio_snapshots(user_id, snapped_at)"
+        )
+
         await db.commit()
 
 # ── Helper: get user language ─────────────────────────────────────────────────
@@ -597,7 +612,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── /help ─────────────────────────────────────────────────────────────────────
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📖 *PANDUAN BOT POKÉMON TCG v5*\n\n"
+        "📖 *PANDUAN BOT POKÉMON TCG v6*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔍 *CEK HARGA*\n"
         "• Ketik nama kartu → cari & lihat harga\n"
@@ -644,6 +659,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/alerts` → Lihat semua alert aktif\n"
         "• `/removealert 1` → Hapus alert nomor 1\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🛒 *HARGA LOKAL & SARAN JUAL*\n"
+        "• `/hargalokal Charizard` → Harga di Tokopedia\n"
+        "• `/saraanjual` → Rekomendasi kartu untuk dijual\n"
+        "• `/portohistory` → Grafik nilai portfolio harian\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📂 *IMPORT MASSAL*\n"
+        "• Kirim file \\. csv → Import semua kartu sekaligus\n"
+        "• Kolom: `card\\_name, card\\_set, buy\\_price\\_usd, condition`\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🛠️ *LAINNYA*\n"
         "• `/scanset Base Set` → Semua kartu di set\n"
         "• `/findcheap Pikachu` → Versi termurah Pikachu\n"
@@ -667,18 +691,48 @@ async def compress_image(photo_bytes: bytearray) -> bytes:
     image.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
-# ── Helper: parse card names dari AI ─────────────────────────────────────────
+# ── Helper: parse card names + kondisi dari AI ───────────────────────────────
 def parse_card_names(raw: str) -> list[str]:
-    lines = raw.strip().splitlines()
-    names = []
-    seen  = set()
-    for line in lines:
-        cleaned = re.sub(r'^[\s\d\.\-\*•]+', '', line).strip()
-        cleaned = re.sub(r'\s*\(.*?\)\s*$', '', cleaned).strip()
-        if cleaned and cleaned.lower() not in seen:
-            seen.add(cleaned.lower())
-            names.append(cleaned)
-    return names
+    """Backward-compat: return list of names only."""
+    return [name for name, _ in parse_card_names_with_condition(raw)]
+
+def parse_card_names_with_condition(raw: str) -> list[tuple[str, str]]:
+    """
+    Parse format baru: 'NAMA: Charizard VMAX | KONDISI: Near Mint'
+    Fallback ke format lama (satu nama per baris).
+    Return list of (name, condition).
+    """
+    VALID_CONDITIONS = {
+        "mint": "Mint", "near mint": "Near Mint", "nm": "Near Mint",
+        "lightly played": "Lightly Played", "lp": "Lightly Played",
+        "moderately played": "Moderately Played", "mp": "Moderately Played",
+        "heavily played": "Heavily Played", "hp": "Heavily Played",
+        "damaged": "Damaged",
+    }
+    results: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Format baru
+        if "NAMA:" in line and "KONDISI:" in line:
+            try:
+                name_part, cond_part = line.split("|", 1)
+                name = name_part.replace("NAMA:", "").strip()
+                cond_raw = cond_part.replace("KONDISI:", "").strip().lower()
+                cond = VALID_CONDITIONS.get(cond_raw, "Near Mint")
+            except Exception:
+                continue
+        else:
+            # Format lama: plain name per line
+            name = re.sub(r'^[\s\d\.\-\*•]+', '', line).strip()
+            name = re.sub(r'\s*\(.*?\)\s*$', '', name).strip()
+            cond = "Near Mint"
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            results.append((name, cond))
+    return results
 
 # ── Handler foto (MULTI-CARD) ─────────────────────────────────────────────────
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -705,11 +759,12 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                         "type": "text",
                         "text": (
                             "Identifikasi SEMUA kartu Pokémon yang terlihat dalam foto ini. "
-                            "Untuk setiap kartu, tulis nama karakter dan variannya saja "
-                            "(contoh: Mewtwo ex, Pikachu ex, Charizard VMAX). "
-                            "Jawab dalam format list, satu kartu per baris, tanpa penomoran, "
-                            "tanpa bullet, tanpa nomor set atau angka lain. "
-                            "Jika hanya ada satu kartu, tulis satu baris saja."
+                            "Untuk setiap kartu, tulis dalam format TEPAT ini (satu baris per kartu):\n"
+                            "NAMA: <nama kartu> | KONDISI: <Mint/Near Mint/Lightly Played/Moderately Played/Heavily Played/Damaged>\n"
+                            "Contoh:\nNAMA: Charizard VMAX | KONDISI: Near Mint\nNAMA: Pikachu ex | KONDISI: Lightly Played\n"
+                            "Nilai kondisi berdasarkan: goresan, kusut, tepi kartu, permukaan. "
+                            "Jika tidak bisa menilai kondisi, tulis Near Mint. "
+                            "JANGAN tambahkan keterangan lain selain format di atas."
                         ),
                     },
                 ],
@@ -722,19 +777,30 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status.edit_text("❌ AI gagal membaca gambar\\. Coba foto lebih jelas ya Bre\\!", parse_mode="MarkdownV2")
             return
 
-        card_names = parse_card_names(raw_text)
-        if not card_names:
+        card_pairs = parse_card_names_with_condition(raw_text)
+        if not card_pairs:
             await status.edit_text("❌ Tidak ada kartu Pokémon terdeteksi\\. Coba foto lebih jelas\\!", parse_mode="MarkdownV2")
             return
 
+        card_names = [name for name, _ in card_pairs]
+        card_conds = [cond for _, cond in card_pairs]
+
+        COND_EMOJI = {
+            "Mint": "🟢", "Near Mint": "🟢", "Lightly Played": "🟡",
+            "Moderately Played": "🟠", "Heavily Played": "🔴", "Damaged": "⚫",
+        }
         count = len(card_names)
         if count == 1:
+            cond_tag = f" \\| {COND_EMOJI.get(card_conds[0], '')} *{esc(card_conds[0])}*"
             await status.edit_text(
-                f"🔍 AI mendeteksi: *{esc(card_names[0])}*\nSedang cari harga\\.\\.\\.",
+                f"🔍 AI mendeteksi: *{esc(card_names[0])}*{cond_tag}\nSedang cari harga\\.\\.\\.",
                 parse_mode="MarkdownV2",
             )
         else:
-            names_preview = "\n".join(f"• {esc(n)}" for n in card_names)
+            names_preview = "\n".join(
+                f"• {esc(n)} {COND_EMOJI.get(c, '')} _{esc(c)}_"
+                for n, c in card_pairs
+            )
             await status.edit_text(
                 f"🃏 AI mendeteksi *{count} kartu*:\n{names_preview}\n\nSedang cek semua harga\\.\\.\\.",
                 parse_mode="MarkdownV2",
@@ -753,7 +819,8 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 msg = "⚠️ Rate limit\\!" if err == "rate_limit" else "⏱️ Timeout\\!" if err == "timeout" else "🔧 API down, coba lagi\\!" if err == "api_down" else "❌ Gagal fetch data\\!"
                 await update.message.reply_text(f"{msg} \\({esc(name)}\\)", parse_mode="MarkdownV2")
                 continue
-            label = "Scan Foto" if count == 1 else f"Scan {found_count + 1}/{count}"
+            cond  = card_conds[list(card_names).index(name)] if name in card_names else "Near Mint"
+            label = f"Scan Foto • {cond}" if count == 1 else f"Scan {found_count + 1}/{count} • {cond}"
             await send_card(update, card, label=label, context=context, show_save_buttons=True)
             found_count += 1
 
@@ -3000,6 +3067,301 @@ async def check_wishlist_targets(context) -> None:
                     logger.warning(f"Wishlist target notif gagal untuk user {user_id}: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FITUR BARU v6
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 1. /hargalokal <nama> — Harga marketplace Tokopedia ──────────────────────
+async def harga_lokal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚠️ Format: `/hargalokal Charizard VMAX`", parse_mode="MarkdownV2"
+        )
+        return
+    query = " ".join(args)
+    await update.message.reply_text(
+        f"🛒 Mencari harga lokal untuk *{esc(query)}*\\.\\.\\.", parse_mode="MarkdownV2"
+    )
+    search_q = f"{query} pokemon card"
+    url = "https://ace.tokopedia.com/search/product/v3"
+    params = {"q": search_q, "rows": 8, "start": 0, "ob": "23", "source": "search"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36",
+        "Referer": "https://www.tokopedia.com/",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+            resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        items = (
+            data.get("data", {}).get("products", [])
+            or data.get("products", [])
+            or []
+        )
+    except Exception as e:
+        # Fallback: link pencarian langsung
+        toko_url = f"https://www.tokopedia.com/search?q={search_q.replace(' ', '+')}"
+        await update.message.reply_text(
+            f"⚠️ Gagal fetch otomatis\\.\n"
+            f"[🔗 Cari di Tokopedia langsung]({toko_url})",
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=False,
+        )
+        return
+
+    if not items:
+        toko_url = f"https://www.tokopedia.com/search?q={search_q.replace(' ', '+')}"
+        await update.message.reply_text(
+            f"❌ Tidak ada hasil di Tokopedia untuk *{esc(query)}*\\.\n"
+            f"[🔗 Cari manual di Tokopedia]({toko_url})",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    lines = [f"🛒 *Harga Tokopedia — {esc(query)}*\n"]
+    shown = 0
+    for item in items[:6]:
+        name  = item.get("name", "")[:45]
+        price = item.get("price", {})
+        if isinstance(price, dict):
+            price_val = price.get("value", 0)
+        else:
+            price_val = int(str(price).replace(".", "").replace(",", "").replace("Rp", "").strip() or 0)
+        shop  = item.get("shop", {}).get("name", "") or item.get("shopName", "")
+        if price_val <= 0:
+            continue
+        price_usd = price_val / EXCHANGE_RATE
+        lines.append(
+            f"• *{esc(name[:40])}*\n"
+            f"  Rp {price_val:,} \\(≈\\${price_usd:.2f}\\) — _{esc(shop)}_"
+        )
+        shown += 1
+    if shown == 0:
+        lines.append("_Tidak ada harga yang bisa ditampilkan\\._")
+    toko_url = f"https://www.tokopedia.com/search?q={search_q.replace(' ', '+')}"
+    lines.append(f"\n[🔗 Lihat semua di Tokopedia]({toko_url})")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+
+# ── 2. /portohistory — Grafik nilai portfolio dari waktu ke waktu ─────────────
+async def save_portfolio_snapshot(user_id: int) -> None:
+    """Simpan snapshot nilai portfolio hari ini (dipanggil otomatis)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT price_usd, condition FROM inventory WHERE user_id=?", (user_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        return
+    CONDITION_MULT = {
+        "Mint": 1.0, "Near Mint": 1.0, "Lightly Played": 0.8,
+        "Moderately Played": 0.65, "Heavily Played": 0.5, "Damaged": 0.25,
+    }
+    total_usd = sum(
+        (r[0] or 0) * CONDITION_MULT.get(r[1] or "Near Mint", 1.0) for r in rows
+    )
+    total_idr = total_usd * EXCHANGE_RATE
+    today = datetime.now().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Upsert: 1 snapshot per hari per user
+        await db.execute(
+            "DELETE FROM portfolio_snapshots WHERE user_id=? AND DATE(snapped_at)=?",
+            (user_id, today),
+        )
+        await db.execute(
+            "INSERT INTO portfolio_snapshots(user_id, total_usd, total_idr, card_count) VALUES(?,?,?,?)",
+            (user_id, total_usd, total_idr, len(rows)),
+        )
+        await db.commit()
+
+
+async def porto_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    # Simpan snapshot hari ini dulu
+    await save_portfolio_snapshot(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT DATE(snapped_at), total_usd, card_count "
+            "FROM portfolio_snapshots WHERE user_id=? "
+            "ORDER BY snapped_at ASC LIMIT 30",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    if len(rows) < 2:
+        await update.message.reply_text(
+            "📈 Belum cukup data untuk grafik\\.\n"
+            "_Gunakan bot setiap hari, data akan terkumpul otomatis\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+    if not HAS_MATPLOTLIB:
+        lines = [f"📅 *Riwayat Nilai Portfolio*\n"]
+        for date, usd, cnt in rows[-10:]:
+            lines.append(f"• `{date}` — \\${usd:.2f} \\({cnt} kartu\\)")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        return
+
+    dates  = [r[0] for r in rows]
+    values = [r[1] for r in rows]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(dates, values, marker="o", color="#5C85FF", linewidth=2.5, markersize=5)
+    ax.fill_between(range(len(dates)), values, alpha=0.15, color="#5C85FF")
+    ax.set_xticks(range(len(dates)))
+    ax.set_xticklabels(dates, rotation=45, ha="right", fontsize=8)
+    ax.set_title(f"📈 Portfolio Value History", fontsize=13, fontweight="bold")
+    ax.set_ylabel("USD ($)")
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.0f}"))
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130)
+    buf.seek(0)
+    plt.close(fig)
+    await update.message.reply_photo(
+        buf,
+        caption=f"📈 Portfolio kamu selama {len(rows)} hari terakhir\nNilai terkini: ${values[-1]:.2f}",
+    )
+
+
+# ── Auto-snapshot harian ──────────────────────────────────────────────────────
+async def auto_snapshot_all(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: simpan snapshot portfolio semua user aktif."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT DISTINCT user_id FROM inventory") as cur:
+            user_ids = [r[0] for r in await cur.fetchall()]
+    for uid in user_ids:
+        try:
+            await save_portfolio_snapshot(uid)
+        except Exception as e:
+            logger.warning(f"Snapshot gagal user {uid}: {e}")
+
+
+# ── 3. Bulk Import CSV — /importcsv ──────────────────────────────────────────
+async def handle_csv_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    User upload file CSV dengan kolom: card_name, card_set, buy_price_usd, condition
+    (kolom lain diabaikan). Bot import semua ke inventory.
+    """
+    doc = update.message.document
+    if not doc or not doc.file_name.lower().endswith(".csv"):
+        return  # bukan CSV, abaikan
+
+    await update.message.reply_text("📂 File CSV diterima\\! Sedang import\\.\\.\\.", parse_mode="MarkdownV2")
+    user_id = update.effective_user.id
+
+    try:
+        file_obj = await doc.get_file()
+        raw_bytes = await file_obj.download_as_bytearray()
+        text = raw_bytes.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = list(reader)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal baca CSV: {esc(str(e))}", parse_mode="MarkdownV2")
+        return
+
+    if not rows:
+        await update.message.reply_text("⚠️ File CSV kosong\\.", parse_mode="MarkdownV2")
+        return
+
+    # Normalisasi header (case-insensitive, strip spasi)
+    def get_col(row: dict, *keys: str) -> str:
+        normalized = {k.strip().lower(): v for k, v in row.items()}
+        for k in keys:
+            if k.lower() in normalized:
+                return normalized[k.lower()].strip()
+        return ""
+
+    imported = 0
+    skipped  = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for row in rows:
+            name = get_col(row, "card_name", "name", "kartu", "nama")
+            if not name:
+                skipped += 1
+                continue
+            card_set  = get_col(row, "card_set", "set", "seri")
+            condition = get_col(row, "condition", "kondisi") or "Near Mint"
+            try:
+                buy_price = float(get_col(row, "buy_price_usd", "harga_beli", "buy_price", "modal") or 0)
+            except ValueError:
+                buy_price = 0.0
+
+            await db.execute(
+                "INSERT INTO inventory(user_id, card_name, card_set, condition, buy_price_usd) VALUES(?,?,?,?,?)",
+                (user_id, name, card_set, condition, buy_price),
+            )
+            imported += 1
+        await db.commit()
+
+    await update.message.reply_text(
+        f"✅ *Import selesai\\!*\n"
+        f"• Berhasil: *{imported} kartu*\n"
+        f"• Dilewati \\(baris kosong\\): {skipped}\n\n"
+        f"_Gunakan /refresh untuk update harga semua kartu\\._",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── 4. /saraanjual — Rekomendasi kartu yang bagus dijual sekarang ─────────────
+async def saran_jual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, buy_price_usd, condition "
+            "FROM inventory WHERE user_id=? AND price_usd > 0",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "📦 Inventory kosong atau belum ada harga\\.\n_Coba /refresh dulu\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    CONDITION_MULT = {
+        "Mint": 1.0, "Near Mint": 1.0, "Lightly Played": 0.8,
+        "Moderately Played": 0.65, "Heavily Played": 0.5, "Damaged": 0.25,
+    }
+    scored = []
+    for inv_id, name, card_set, price_usd, buy_price, condition in rows:
+        mult = CONDITION_MULT.get(condition or "Near Mint", 1.0)
+        real_price = price_usd * mult
+        buy = buy_price or 0.0
+        roi = ((real_price - buy) / buy * 100) if buy > 0 else None
+        scored.append({
+            "id": inv_id, "name": name, "set": card_set or "",
+            "price": real_price, "buy": buy, "roi": roi,
+            "condition": condition or "Near Mint",
+        })
+
+    # Sort: ROI tertinggi (kalau ada modal), lalu harga terbesar
+    with_roi    = sorted([s for s in scored if s["roi"] is not None], key=lambda x: x["roi"], reverse=True)
+    without_roi = sorted([s for s in scored if s["roi"] is None], key=lambda x: x["price"], reverse=True)
+    top = (with_roi + without_roi)[:8]
+
+    if not top:
+        await update.message.reply_text("⚠️ Tidak cukup data untuk saran jual\\.", parse_mode="MarkdownV2")
+        return
+
+    lines = ["💡 *SARAN KARTU YANG BAGUS DIJUAL SEKARANG*\n"]
+    for i, c in enumerate(top, 1):
+        price_idr = c["price"] * EXCHANGE_RATE
+        roi_tag = f"ROI *\\+{c['roi']:.0f}%*" if c["roi"] and c["roi"] > 0 else (
+                  f"ROI *{c['roi']:.0f}%* ⚠️" if c["roi"] else "ROI _belum diset_")
+        lines.append(
+            f"*{i}\\. {esc(c['name'])}* _\\({esc(c['set'])}\\)_\n"
+            f"   💵 \\${c['price']:.2f} \\(Rp {price_idr:,.0f}\\) — {roi_tag}\n"
+            f"   Kondisi: {esc(c['condition'])} \\| ID: #{c['id']}"
+        )
+    lines.append("\n_Gunakan /jual \\<id\\> \\<harga\\> untuk catat penjualan\\._")
+    await update.message.reply_text("\n\n".join(lines), parse_mode="MarkdownV2")
+
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 async def post_init(application) -> None:
     await init_db()
@@ -3068,13 +3430,22 @@ def main() -> None:
     app.add_handler(CommandHandler("gen",           gen_browse))
     app.add_handler(CommandHandler("synccards",     sync_cards_cmd))
     app.add_handler(CommandHandler("cari",          cari_lokal))
+    # Commands baru v6
+    app.add_handler(CommandHandler("hargalokal",   harga_lokal_cmd))
+    app.add_handler(CommandHandler("portohistory", porto_history_cmd))
+    app.add_handler(CommandHandler("saraanjual",   saran_jual_cmd))
 
     app.add_handler(CallbackQueryHandler(handle_snap_save,   pattern=r"^snap_(save|buy|wish):"))
     app.add_handler(CallbackQueryHandler(handle_card_select, pattern=r"^card_select:"))
-    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo_search))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_card_search_v4))
+    app.add_handler(MessageHandler(filters.PHOTO,                      handle_photo_search))
+    app.add_handler(MessageHandler(filters.Document.ALL,               handle_csv_upload))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,    handle_card_search_v4))
 
-    logger.info("Bot Pokémon Vision & Portfolio v5 aktif! (+foto→simpan, tombol inventory/wishlist)")
+    # Background jobs
+    jq = app.job_queue
+    jq.run_repeating(auto_snapshot_all, interval=86400, first=60)   # snapshot harian
+
+    logger.info("Bot Pokémon Vision & Portfolio v6 aktif! (+hargalokal, AI grading, portohistory, CSV import, saraanjual)")
     app.run_polling()
 
 if __name__ == "__main__":
