@@ -159,6 +159,55 @@ def _tcg_headers() -> dict:
         headers["X-Api-Key"] = POKEMON_TCG_API_KEY
     return headers
 
+# ── TCGdex — image fallback ────────────────────────────────────────────────────
+async def fetch_tcgdex_image(card_name: str, set_name: str = "") -> str | None:
+    """
+    Cari gambar dari tcgdex.dev sebagai fallback kalau pokemontcg.io tidak punya.
+    Return URL gambar high-quality WebP, atau None kalau tidak ditemukan.
+    """
+    try:
+        # Coba exact match dulu (case-sensitive), lalu contains match
+        for query in [f"eq:{card_name}", card_name.split()[0]]:
+            url = f"https://api.tcgdex.net/v2/en/cards?name={query}&limit=20"
+            async with httpx.AsyncClient(timeout=10) as http:
+                r = await http.get(url)
+            if r.status_code != 200:
+                continue
+            cards = r.json()
+            if not cards or not isinstance(cards, list):
+                continue
+
+            # Cari kartu yang punya gambar
+            candidates = [c for c in cards if c.get("image")]
+            if not candidates:
+                continue
+
+            # Kalau ada set_name, coba cocokkan dari card id (format: setId-localId)
+            if set_name:
+                set_lower = set_name.lower().replace(" ", "")
+                for c in candidates:
+                    card_id = c.get("id", "")
+                    set_part = card_id.split("-")[0].lower() if "-" in card_id else ""
+                    if set_part and set_part in set_lower or set_lower in set_part:
+                        return f"{c['image']}/high.webp"
+
+            # Fallback: pakai kandidat pertama yang ada gambarnya
+            return f"{candidates[0]['image']}/high.webp"
+
+    except Exception as e:
+        logger.debug(f"TCGdex image fallback failed for '{card_name}': {e}")
+    return None
+
+async def _fill_missing_image(card: dict) -> dict:
+    """Isi image yang kosong dari pokemontcg menggunakan tcgdex sebagai fallback."""
+    if card.get("image"):
+        return card
+    img = await fetch_tcgdex_image(card.get("name", ""), card.get("set", ""))
+    if img:
+        card = dict(card)  # copy biar tidak mutate original
+        card["image"] = img
+    return card
+
 # ── Pokemon TCG API — single best match ───────────────────────────────────────
 async def search_pokemon_card(card_name: str) -> dict | None:
     clean  = card_name.strip()
@@ -185,7 +234,8 @@ async def search_pokemon_card(card_name: str) -> dict | None:
             if " v" in clean_low and any(x in title for x in ["vmax", "vstar", " v"]):
                 selected = card; break
 
-        return _extract_card(selected)
+        result = _extract_card(selected)
+        return await _fill_missing_image(result)
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
@@ -209,7 +259,8 @@ async def search_pokemon_cards_multi(card_name: str, limit: int = 5) -> list | d
         if not cards_list:
             return None
 
-        return [_extract_card(c) for c in cards_list[:limit]]
+        extracted = [_extract_card(c) for c in cards_list[:limit]]
+        return list(await asyncio.gather(*[_fill_missing_image(c) for c in extracted]))
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
@@ -232,7 +283,8 @@ async def search_pokemon_set(set_name: str, limit: int = 100) -> dict | None:
         if not cards_list:
             return None
 
-        return {"cards": [_extract_card(c) for c in cards_list], "total": total}
+        filled = list(await asyncio.gather(*[_fill_missing_image(_extract_card(c)) for c in cards_list]))
+        return {"cards": filled, "total": total}
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
@@ -254,8 +306,8 @@ async def search_all_versions(card_name: str) -> list | dict | None:
         if not cards_list:
             return None
 
-        extracted    = [_extract_card(c) for c in cards_list]
-        with_price   = sorted([c for c in extracted if c["price_usd"] > 0], key=lambda x: x["price_usd"])
+        extracted     = list(await asyncio.gather(*[_fill_missing_image(_extract_card(c)) for c in cards_list]))
+        with_price    = sorted([c for c in extracted if c["price_usd"] > 0], key=lambda x: x["price_usd"])
         without_price = [c for c in extracted if c["price_usd"] == 0]
         return with_price + without_price
 
