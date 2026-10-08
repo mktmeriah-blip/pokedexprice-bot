@@ -903,41 +903,14 @@ async def handle_ocr_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not name:
         await query.message.reply_text("⚠️ Data expired, kirim foto lagi bre\\.", parse_mode="MarkdownV2")
         return
+    # Langsung minta harga, tidak perlu cari API
+    context.bot_data[f"pending_manual_name_{user_id}"] = name
+    context.bot_data[f"pending_manual_price_{user_id}"] = True
     await query.message.reply_text(
-        f"🔍 Mencari *{esc(name)}*\\.\\.\\.", parse_mode="MarkdownV2"
+        f"✅ Nama kartu: *{esc(name)}*\n\n"
+        f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
+        parse_mode="MarkdownV2",
     )
-    results = await search_pokemon_cards_multi(name, limit=5)
-    not_found = not results or (isinstance(results, list) and len(results) == 0)
-    has_error = isinstance(results, dict) and results.get("error")
-    if has_error or not_found:
-        context.bot_data[f"pending_manual_name_{user_id}"] = name
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💾 Simpan Manual (isi harga sendiri)", callback_data=f"manual_save:{user_id}")],
-            [InlineKeyboardButton("🔍 Coba nama lain", callback_data=f"manual_retry:{user_id}")],
-        ])
-        await query.message.reply_text(
-            f"❌ *{esc(name)}* tidak ditemukan di database\\.\n\nMau simpan manual?",
-            reply_markup=keyboard,
-            parse_mode="MarkdownV2",
-        )
-    elif len(results) == 1:
-        await send_card(
-            update, results[0], context=context, show_save_buttons=True
-        )
-    else:
-        keyboard = []
-        for i, card in enumerate(results):
-            price_str = f"${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
-            keyboard.append([InlineKeyboardButton(
-                f"{card['name']} ({card['set']}) — {price_str}",
-                callback_data=f"card_select:{i}:{user_id}",
-            )])
-        context.bot_data[f"search_{user_id}"] = results
-        await query.message.reply_text(
-            f"🃏 Ditemukan *{len(results)} kartu* untuk *{esc(name)}*\\:\n_Pilih yang sesuai:_",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="MarkdownV2",
-        )
 
 async def handle_ocr_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query   = update.callback_query
@@ -982,8 +955,8 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.bot_data[f"pending_photo_name_{user_id}"] = True
             await status.edit_text(
                 "📸 Foto diterima\\!\n\n"
-                "📝 *Ketik nama kartunya bre*, nanti bot cari harga otomatis\\!\n"
-                "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
+                "📝 *Ketik nama kartunya bre:*\n"
+                "_Contoh: `Pikachu Gym Event Campaign`_",
                 parse_mode="MarkdownV2",
             )
     else:
@@ -991,8 +964,8 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.bot_data[f"pending_photo_name_{user_id}"] = True
         await update.message.reply_text(
             "📸 Foto diterima\\!\n\n"
-            "📝 *Ketik nama kartunya bre*, nanti bot cari harga otomatis\\!\n"
-            "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
+            "📝 *Ketik nama kartunya bre:*\n"
+            "_Contoh: `Pikachu Gym Event Campaign`_",
             parse_mode="MarkdownV2",
         )
 
@@ -2430,40 +2403,14 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Cek pending_photo_name: user ketik nama manual setelah foto ──────────────
     if context.bot_data.pop(f"pending_photo_name_{user_id}", False):
+        # Langsung minta harga, tidak perlu cari API
+        context.bot_data[f"pending_manual_name_{user_id}"] = text
+        context.bot_data[f"pending_manual_price_{user_id}"] = True
         await update.message.reply_text(
-            f"🔍 Mencari *{esc(text)}* dari input manual\\.\\.\\.", parse_mode="MarkdownV2"
+            f"✅ Nama kartu: *{esc(text)}*\n\n"
+            f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
+            parse_mode="MarkdownV2",
         )
-        results = await search_pokemon_cards_multi(text, limit=5)
-        not_found = not results or (isinstance(results, list) and len(results) == 0)
-        has_error = isinstance(results, dict) and results.get("error")
-        if has_error or not_found:
-            context.bot_data[f"pending_manual_name_{user_id}"] = text
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💾 Simpan Manual (isi harga sendiri)", callback_data=f"manual_save:{user_id}")],
-                [InlineKeyboardButton("🔍 Coba nama lain", callback_data=f"manual_retry:{user_id}")],
-            ])
-            await update.message.reply_text(
-                f"❌ *{esc(text)}* tidak ditemukan di database\\.\n\n"
-                "Mau simpan manual dengan harga kamu sendiri?",
-                reply_markup=keyboard,
-                parse_mode="MarkdownV2",
-            )
-        elif len(results) == 1:
-            await send_card(update, results[0], context=context, show_save_buttons=True)
-        else:
-            keyboard = []
-            for i, card in enumerate(results):
-                price_str = f"${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
-                keyboard.append([InlineKeyboardButton(
-                    f"{card['name']} ({card['set']}) — {price_str}",
-                    callback_data=f"card_select:{i}:{user_id}",
-                )])
-            context.bot_data[f"search_{user_id}"] = results
-            await update.message.reply_text(
-                f"🃏 Ditemukan *{len(results)} kartu* untuk *{esc(text)}*\\:\n_Pilih yang sesuai:_",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="MarkdownV2",
-            )
         return
 
     # ── Cek pending_buy: user balas harga modal setelah klik "Simpan + Set Modal" ──
