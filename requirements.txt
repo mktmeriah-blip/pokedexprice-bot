@@ -3,3 +3,4 @@ Pillow
 aiosqlite
 httpx
 python-dotenv
+pytesseract
