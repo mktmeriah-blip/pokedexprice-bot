@@ -1936,6 +1936,461 @@ async def export_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ── FITUR BARU v4 — Generation browse, newsets, cache, autocomplete ───────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Mapping generasi → series TCG
+GEN_SERIES_MAP: dict[int, list[str]] = {
+    1: ["Base", "Gym"],
+    2: ["Neo", "Southern Islands"],
+    3: ["EX", "e-Card"],
+    4: ["Diamond & Pearl", "Platinum", "HeartGold & SoulSilver"],
+    5: ["Black & White"],
+    6: ["XY"],
+    7: ["Sun & Moon"],
+    8: ["Sword & Shield"],
+    9: ["Scarlet & Violet"],
+}
+GEN_LABEL = {
+    1: "Gen 1 — Kanto 🔴", 2: "Gen 2 — Johto 🌿", 3: "Gen 3 — Hoenn 🌊",
+    4: "Gen 4 — Sinnoh 💎", 5: "Gen 5 — Unova ⚫", 6: "Gen 6 — Kalos 🌸",
+    7: "Gen 7 — Alola 🌺", 8: "Gen 8 — Galar 🗡️", 9: "Gen 9 — Paldea 🟣",
+}
+
+# ── Sync card cache dari TCG API ──────────────────────────────────────────────
+async def sync_card_cache(max_pages: int = 20) -> int:
+    """Ambil kartu dari TCG API dan simpan ke card_cache. Return jumlah yang di-insert."""
+    inserted = 0
+    page     = 1
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM card_cache")
+        await db.commit()
+
+        while page <= max_pages:
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    resp = await client.get(
+                        "https://api.pokemontcg.io/v2/cards",
+                        headers=_tcg_headers(),
+                        params={
+                            "page": page, "pageSize": 250,
+                            "select": "id,name,set,tcgplayer",
+                        },
+                    )
+                if resp.status_code != 200:
+                    break
+                data  = resp.json()
+                cards = data.get("data", [])
+                if not cards:
+                    break
+
+                rows = []
+                for c in cards:
+                    name     = c.get("name", "")
+                    s        = c.get("set", {})
+                    card_set = s.get("name", "")
+                    series   = s.get("series", "")
+                    set_id   = s.get("id", "")
+                    rel_date = s.get("releaseDate", "")
+                    prices   = (c.get("tcgplayer") or {}).get("prices", {})
+                    price_usd = 0.0
+                    for ptype in ("holofoil", "normal", "reverseHolofoil", "1stEditionHolofoil"):
+                        pdata = prices.get(ptype, {})
+                        mid   = pdata.get("mid") or pdata.get("market") or 0
+                        if mid:
+                            price_usd = float(mid)
+                            break
+                    rows.append((name, card_set, series, set_id, price_usd, rel_date))
+
+                await db.executemany(
+                    "INSERT INTO card_cache (name, card_set, set_series, set_id, price_usd, release_date) VALUES (?,?,?,?,?,?)",
+                    rows,
+                )
+                await db.commit()
+                inserted += len(rows)
+
+                total_count = data.get("totalCount", 0)
+                if page * 250 >= total_count:
+                    break
+                page += 1
+
+            except Exception as e:
+                logger.warning(f"sync_card_cache page {page} error: {e}")
+                break
+
+    return inserted
+
+
+# ── /synccards — Sync manual ──────────────────────────────────────────────────
+async def sync_cards_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text(
+        "🔄 Sinkronisasi database kartu dari TCG API\\.\\.\\.\n"
+        "_Ini bisa makan waktu 1\\-2 menit_ ☕",
+        parse_mode="MarkdownV2",
+    )
+    try:
+        n = await sync_card_cache(max_pages=30)
+        await msg.edit_text(
+            f"✅ *Sinkronisasi selesai\\!*\n"
+            f"📦 {esc(str(n))} kartu tersimpan di database lokal\\.",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Gagal sync: {esc(str(e))}", parse_mode="MarkdownV2")
+
+
+# ── Background job: auto-sync setiap 24 jam ───────────────────────────────────
+async def auto_sync_cache(context) -> None:
+    logger.info("Auto-sync card cache dimulai...")
+    n = await sync_card_cache(max_pages=30)
+    logger.info(f"Auto-sync selesai: {n} kartu")
+
+
+# ── Autocomplete helper ───────────────────────────────────────────────────────
+async def get_autocomplete_suggestions(query: str, limit: int = 5) -> list[str]:
+    """Cari nama kartu mirip dari cache lokal."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT DISTINCT name FROM card_cache WHERE LOWER(name) LIKE LOWER(?) LIMIT 50",
+            (f"%{query}%",),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if rows:
+        names = [r[0] for r in rows]
+        return names[:limit]
+
+    # fallback: fuzzy match dari semua nama
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT DISTINCT name FROM card_cache LIMIT 5000") as cur:
+            all_names = [r[0] for r in await cur.fetchall()]
+
+    if not all_names:
+        return []
+
+    matches = difflib.get_close_matches(query, all_names, n=limit, cutoff=0.5)
+    return matches
+
+
+# ── Patch handle_card_search → tambah autocomplete saat tidak ditemukan ───────
+async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.message.text.strip()
+    await update.message.reply_text(f"🔍 Mencari kartu *{esc(query)}*\\.\\.\\.", parse_mode="MarkdownV2")
+
+    results = await search_pokemon_cards_multi(query, limit=5)
+
+    not_found = (
+        results is None
+        or (isinstance(results, list) and len(results) == 0)
+    )
+    has_error = isinstance(results, dict) and results.get("error")
+
+    if has_error:
+        err = results["error"]
+        if err == "rate_limit":
+            await update.message.reply_text("⚠️ API rate limit, tunggu sebentar\\!", parse_mode="MarkdownV2")
+        elif err == "timeout":
+            await update.message.reply_text("⏱️ Timeout\\! Coba lagi ya\\.", parse_mode="MarkdownV2")
+        elif err == "api_down":
+            await update.message.reply_text(
+                "🔧 Pokemontcg\\.io lagi gangguan bre\\! Coba lagi beberapa menit\\.",
+                parse_mode="MarkdownV2",
+            )
+        else:
+            await update.message.reply_text("❌ Gagal fetch data kartu bre, coba lagi\\!", parse_mode="MarkdownV2")
+        return
+
+    if not_found:
+        # Coba autocomplete dari cache lokal
+        suggestions = await get_autocomplete_suggestions(query, limit=6)
+        if suggestions:
+            lines = [f"❌ *'{esc(query)}'* tidak ditemukan\\.\n\n💡 *Maksud kamu mungkin:*"]
+            for s in suggestions:
+                lines.append(f"• `{esc(s)}`")
+            lines.append("\n_Ketik nama yang tepat untuk cari\\._")
+            await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        else:
+            await update.message.reply_text(
+                f"❌ Kartu '{esc(query)}' tidak ditemukan, Bre\\!\n"
+                "_Coba /synccards untuk update database lokal\\._",
+                parse_mode="MarkdownV2",
+            )
+        return
+
+    if len(results) == 1:
+        await send_card(update, results[0])
+        return
+
+    keyboard = []
+    for i, card in enumerate(results):
+        price_str = f"${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+        btn_label = f"{card['name']} ({card['set']}) — {price_str}"
+        keyboard.append([InlineKeyboardButton(btn_label, callback_data=f"card_select:{i}:{update.effective_user.id}")])
+
+    context.bot_data[f"search_{update.effective_user.id}"] = results
+
+    await update.message.reply_text(
+        f"🃏 Ditemukan *{len(results)} kartu* untuk *{esc(query)}*\\:\n_Pilih yang sesuai:_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /newsets — Set TCG yang rilis dalam 1 tahun terakhir ─────────────────────
+async def new_sets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("📅 Mengambil daftar set terbaru\\.\\.\\.", parse_mode="MarkdownV2")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://api.pokemontcg.io/v2/sets",
+                headers=_tcg_headers(),
+                params={"orderBy": "-releaseDate", "pageSize": 50},
+            )
+        if resp.status_code != 200:
+            await update.message.reply_text("❌ Gagal ambil data set\\.", parse_mode="MarkdownV2")
+            return
+        sets = resp.json().get("data", [])
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {esc(str(e))}", parse_mode="MarkdownV2")
+        return
+
+    cutoff  = (datetime.now() - timedelta(days=365)).strftime("%Y/%m/%d")
+    recent  = [s for s in sets if s.get("releaseDate", "0") >= cutoff]
+
+    if not recent:
+        await update.message.reply_text("📭 Tidak ada set baru dalam 1 tahun terakhir\\.", parse_mode="MarkdownV2")
+        return
+
+    lines = [f"🆕 *Set Pokémon TCG — 1 Tahun Terakhir \\({len(recent)} set\\)*\n"]
+    for s in recent[:20]:
+        name     = s.get("name", "?")
+        series   = s.get("series", "?")
+        rel_date = s.get("releaseDate", "?")
+        total    = s.get("total", "?")
+        printed  = s.get("printedTotal", total)
+        lines.append(
+            f"📦 *{esc(name)}*\n"
+            f"   Series: {esc(series)} \\| Rilis: {esc(rel_date)}\n"
+            f"   🃏 {esc(str(printed))}/{esc(str(total))} kartu\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /newcards — Kartu mahal dari set terbaru ──────────────────────────────────
+async def new_cards_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🆕 Mengambil kartu dari set terbaru\\.\\.\\.", parse_mode="MarkdownV2"
+    )
+    try:
+        # Ambil set terbaru
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://api.pokemontcg.io/v2/sets",
+                headers=_tcg_headers(),
+                params={"orderBy": "-releaseDate", "pageSize": 3},
+            )
+        if resp.status_code != 200:
+            raise Exception("Gagal ambil set")
+        latest_sets = resp.json().get("data", [])[:3]
+        if not latest_sets:
+            raise Exception("Tidak ada data set")
+
+        all_cards = []
+        async with httpx.AsyncClient(timeout=20) as client:
+            for s in latest_sets:
+                sid  = s.get("id", "")
+                sname = s.get("name", "")
+                r2 = await client.get(
+                    "https://api.pokemontcg.io/v2/cards",
+                    headers=_tcg_headers(),
+                    params={"q": f"set.id:{sid}", "pageSize": 30,
+                            "select": "id,name,set,tcgplayer,rarity"},
+                )
+                if r2.status_code == 200:
+                    for c in r2.json().get("data", []):
+                        prices = (c.get("tcgplayer") or {}).get("prices", {})
+                        p_usd  = 0.0
+                        for pt in ("holofoil", "normal", "reverseHolofoil"):
+                            mid = (prices.get(pt) or {}).get("mid") or (prices.get(pt) or {}).get("market") or 0
+                            if mid:
+                                p_usd = float(mid)
+                                break
+                        all_cards.append({
+                            "name": c.get("name", "?"),
+                            "set":  sname,
+                            "price_usd": p_usd,
+                            "rarity": c.get("rarity", "?"),
+                        })
+
+        if not all_cards:
+            await update.message.reply_text("📭 Tidak ada data kartu terbaru\\.", parse_mode="MarkdownV2")
+            return
+
+        # Sort by harga
+        all_cards.sort(key=lambda x: x["price_usd"], reverse=True)
+        top = all_cards[:15]
+
+        lines = [f"🏆 *Kartu Termahal dari {len(latest_sets)} Set Terbaru*\n"]
+        for i, c in enumerate(top, 1):
+            p_str = f"\\${c['price_usd']:.2f}" if c["price_usd"] > 0 else "N/A"
+            lines.append(
+                f"{i}\\. *{esc(c['name'])}*\n"
+                f"   📦 {esc(c['set'])} \\| ✨ {esc(c['rarity'])} \\| 💵 {p_str}\n"
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal: {esc(str(e))}", parse_mode="MarkdownV2")
+
+
+# ── /gen <N> — Browse kartu berdasarkan generasi ─────────────────────────────
+async def gen_browse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        lines = ["🎮 *Browse per Generasi*\n", "_Gunakan: /gen \\<nomor\\>_\n"]
+        for g, label in GEN_LABEL.items():
+            lines.append(f"• /gen {g} — {esc(label)}")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        return
+
+    try:
+        gen_num = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ Nomor generasi harus angka 1\\-9\\.", parse_mode="MarkdownV2")
+        return
+
+    if gen_num not in GEN_SERIES_MAP:
+        await update.message.reply_text("⚠️ Generasi tersedia: 1 sampai 9\\.", parse_mode="MarkdownV2")
+        return
+
+    series_list = GEN_SERIES_MAP[gen_num]
+    label       = GEN_LABEL[gen_num]
+
+    await update.message.reply_text(
+        f"🎮 Mengambil kartu *{esc(label)}*\\.\\.\\.", parse_mode="MarkdownV2"
+    )
+
+    # Coba dari cache lokal dulu
+    async with aiosqlite.connect(DB_PATH) as db:
+        placeholders = ",".join("?" * len(series_list))
+        async with db.execute(
+            f"SELECT name, card_set, price_usd FROM card_cache "
+            f"WHERE set_series IN ({placeholders}) AND price_usd > 0 "
+            f"ORDER BY price_usd DESC LIMIT 20",
+            series_list,
+        ) as cur:
+            cached = await cur.fetchall()
+
+    if cached:
+        lines = [f"🎮 *{esc(label)}*\n_Top 20 by harga \\(dari cache lokal\\)_\n"]
+        for i, (name, card_set, p_usd) in enumerate(cached, 1):
+            p_str = f"\\${p_usd:.2f}"
+            lines.append(f"{i}\\. *{esc(name)}* — {esc(card_set or '-')} \\| {p_str}")
+        lines.append(f"\n_Update cache: /synccards_")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        return
+
+    # Fallback: ambil dari API
+    try:
+        query_parts = [f'set.series:"{s}"' for s in series_list]
+        q_str       = " OR ".join(query_parts)
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://api.pokemontcg.io/v2/cards",
+                headers=_tcg_headers(),
+                params={
+                    "q":        q_str,
+                    "pageSize": 30,
+                    "orderBy":  "-tcgplayer.prices.holofoil.mid",
+                    "select":   "id,name,set,tcgplayer,rarity",
+                },
+            )
+        if resp.status_code != 200:
+            raise Exception("API error")
+        api_cards = resp.json().get("data", [])
+        if not api_cards:
+            await update.message.reply_text(
+                f"📭 Tidak ada data kartu untuk {esc(label)}\\.\n_Coba /synccards dulu\\._",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        extracted = []
+        for c in api_cards:
+            prices = (c.get("tcgplayer") or {}).get("prices", {})
+            p_usd  = 0.0
+            for pt in ("holofoil", "normal", "reverseHolofoil"):
+                mid = (prices.get(pt) or {}).get("mid") or (prices.get(pt) or {}).get("market") or 0
+                if mid:
+                    p_usd = float(mid)
+                    break
+            extracted.append({
+                "name": c.get("name", "?"),
+                "set":  (c.get("set") or {}).get("name", "?"),
+                "price_usd": p_usd,
+                "rarity": c.get("rarity", "?"),
+            })
+        extracted.sort(key=lambda x: x["price_usd"], reverse=True)
+
+        lines = [f"🎮 *{esc(label)}*\n_Top kartu \\(dari API\\)_\n"]
+        for i, c in enumerate(extracted[:20], 1):
+            p_str = f"\\${c['price_usd']:.2f}" if c["price_usd"] > 0 else "N/A"
+            lines.append(
+                f"{i}\\. *{esc(c['name'])}* — {esc(c['set'])} \\| {esc(c['rarity'])} \\| {p_str}"
+            )
+        lines.append(f"\n_Untuk hasil lebih lengkap jalankan /synccards_")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Gagal ambil data: {esc(str(e))}\n_Coba /synccards untuk build cache lokal\\._",
+            parse_mode="MarkdownV2",
+        )
+
+
+# ── /cari <query> — Cari dari cache lokal ────────────────────────────────────
+async def cari_lokal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/cari \\<nama\\>`\nContoh: `/cari Charizard`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    query = " ".join(context.args).strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT name, card_set, set_series, price_usd FROM card_cache "
+            "WHERE LOWER(name) LIKE LOWER(?) ORDER BY price_usd DESC LIMIT 15",
+            (f"%{query}%",),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        suggestions = await get_autocomplete_suggestions(query, limit=5)
+        if suggestions:
+            lines = [f"🔍 *'{esc(query)}'* tidak ditemukan di cache\\.\n\n💡 *Mungkin maksudnya:*"]
+            for s in suggestions:
+                lines.append(f"• `{esc(s)}`")
+            await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        else:
+            await update.message.reply_text(
+                f"📭 Tidak ada kartu '{esc(query)}' di cache lokal\\.\n_Jalankan /synccards untuk update\\._",
+                parse_mode="MarkdownV2",
+            )
+        return
+
+    lines = [f"🔍 *Hasil Cache: '{esc(query)}' \\({len(rows)} kartu\\)*\n"]
+    for name, card_set, series, p_usd in rows:
+        p_str = f"\\${p_usd:.2f}" if p_usd > 0 else "N/A"
+        lines.append(f"• *{esc(name)}* — {esc(card_set or '?')} \\| {esc(series or '?')} \\| {p_str}")
+    lines.append("\n_Ketik nama kartu langsung untuk cek harga real\\-time_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ── FITUR BARU v3 ─────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2451,7 +2906,13 @@ async def post_init(application) -> None:
         first=120,
         name="wishlist_target_checker",
     )
-    logger.info("Price alert + wishlist target checker dijadwalkan setiap 6 jam.")
+    application.job_queue.run_repeating(
+        auto_sync_cache,
+        interval=24 * 3600,
+        first=180,
+        name="card_cache_syncer",
+    )
+    logger.info("Price alert + wishlist + card cache syncer dijadwalkan.")
 
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -2491,12 +2952,18 @@ def main() -> None:
     app.add_handler(CommandHandler("setkomplit",    set_completion))
     app.add_handler(CommandHandler("jual",          jual_kartu))
     app.add_handler(CommandHandler("riwayatjual",   riwayat_jual))
+    # Commands baru v4
+    app.add_handler(CommandHandler("newsets",       new_sets_cmd))
+    app.add_handler(CommandHandler("newcards",      new_cards_cmd))
+    app.add_handler(CommandHandler("gen",           gen_browse))
+    app.add_handler(CommandHandler("synccards",     sync_cards_cmd))
+    app.add_handler(CommandHandler("cari",          cari_lokal))
 
     app.add_handler(CallbackQueryHandler(handle_card_select, pattern=r"^card_select:"))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo_search))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_card_search))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_card_search_v4))
 
-    logger.info("Bot Pokémon Vision & Portfolio v3 aktif! (buyprice, roi, trend, setkomplit, jual)")
+    logger.info("Bot Pokémon Vision & Portfolio v4 aktif! (+gen, newsets, newcards, synccards, cari, autocomplete)")
     app.run_polling()
 
 if __name__ == "__main__":
