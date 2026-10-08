@@ -717,6 +717,32 @@ def parse_card_names_with_condition(raw: str) -> list[tuple[str, str]]:
             results.append((name, cond))
     return results
 
+# ── Handler manual save (tombol setelah kartu tidak ditemukan) ───────────────
+async def handle_manual_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    await query.answer()
+    user_id   = update.effective_user.id
+    card_name = context.bot_data.pop(f"pending_manual_name_{user_id}", "Unknown Card")
+    context.bot_data.pop(f"pending_photo_name_{user_id}", None)
+    context.bot_data[f"pending_manual_price_{user_id}"] = card_name
+    await query.message.reply_text(
+        f"💰 *Berapa harga kartu ini \\(USD\\)?*\n"
+        f"Kartu: *{esc(card_name)}*\n\n"
+        f"Ketik nominalnya bre, contoh: `25\\.5`",
+        parse_mode="MarkdownV2",
+    )
+
+async def handle_manual_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    context.bot_data.pop(f"pending_manual_name_{user_id}", None)
+    context.bot_data[f"pending_photo_name_{user_id}"] = True
+    await query.message.reply_text(
+        "📝 Ketik nama kartunya lagi bre:",
+        parse_mode="MarkdownV2",
+    )
+
 # ── Handler foto ─────────────────────────────────────────────────────────────
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -2118,7 +2144,38 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     text    = update.message.text.strip()
 
-    # ── Cek pending_photo_name: AI foto gagal, user ketik nama manual ────────────
+    # ── Cek pending_manual_price: user ketik harga setelah klik Simpan Manual ──
+    pending_manual = context.bot_data.get(f"pending_manual_price_{user_id}")
+    if pending_manual is not None:
+        try:
+            price_usd = float(text.replace(",", "."))
+            price_idr = price_usd * EXCHANGE_RATE
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute(
+                    "INSERT INTO inventory (user_id, card_name, price_usd, price_idr, condition) VALUES (?,?,?,?,?)",
+                    (user_id, pending_manual, price_usd, price_idr, "Near Mint"),
+                )
+                new_id = cur.lastrowid
+                await db.execute(
+                    "INSERT INTO price_history (user_id, card_name, price_usd, price_idr) VALUES (?,?,?,?)",
+                    (user_id, pending_manual, price_usd, price_idr),
+                )
+                await db.commit()
+            del context.bot_data[f"pending_manual_price_{user_id}"]
+            await update.message.reply_text(
+                f"✅ *{esc(pending_manual)}* disimpan\\! \\(ID: \\#{new_id}\\)\n"
+                f"💵 \\${price_usd:.2f} \\| Rp {price_idr:,.0f}\n\n"
+                f"_Set kondisi: /setcondition {new_id}_",
+                parse_mode="MarkdownV2",
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Masukkan angka yang valid bre\\!\n_Contoh: `25\\.5` atau `100`_",
+                parse_mode="MarkdownV2",
+            )
+        return
+
+    # ── Cek pending_photo_name: user ketik nama manual setelah foto ──────────────
     if context.bot_data.pop(f"pending_photo_name_{user_id}", False):
         await update.message.reply_text(
             f"🔍 Mencari *{esc(text)}* dari input manual\\.\\.\\.", parse_mode="MarkdownV2"
@@ -2127,9 +2184,15 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
         not_found = not results or (isinstance(results, list) and len(results) == 0)
         has_error = isinstance(results, dict) and results.get("error")
         if has_error or not_found:
+            context.bot_data[f"pending_manual_name_{user_id}"] = text
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💾 Simpan Manual (isi harga sendiri)", callback_data=f"manual_save:{user_id}")],
+                [InlineKeyboardButton("🔍 Coba nama lain", callback_data=f"manual_retry:{user_id}")],
+            ])
             await update.message.reply_text(
-                f"❌ *{esc(text)}* tidak ditemukan\\.\n"
-                "_Coba ketik nama lebih lengkap atau berbeda\\._",
+                f"❌ *{esc(text)}* tidak ditemukan di database\\.\n\n"
+                "Mau simpan manual dengan harga kamu sendiri?",
+                reply_markup=keyboard,
                 parse_mode="MarkdownV2",
             )
         elif len(results) == 1:
@@ -3417,8 +3480,10 @@ def main() -> None:
     app.add_handler(CommandHandler("saraanjual",   saran_jual_cmd))
     app.add_handler(CommandHandler("editprice",    edit_price_cmd))
 
-    app.add_handler(CallbackQueryHandler(handle_snap_save,   pattern=r"^snap_(save|buy|wish):"))
-    app.add_handler(CallbackQueryHandler(handle_card_select, pattern=r"^card_select:"))
+    app.add_handler(CallbackQueryHandler(handle_snap_save,    pattern=r"^snap_(save|buy|wish):"))
+    app.add_handler(CallbackQueryHandler(handle_card_select,  pattern=r"^card_select:"))
+    app.add_handler(CallbackQueryHandler(handle_manual_save,  pattern=r"^manual_save:"))
+    app.add_handler(CallbackQueryHandler(handle_manual_retry, pattern=r"^manual_retry:"))
     app.add_handler(MessageHandler(filters.PHOTO,                      handle_photo_search))
     app.add_handler(MessageHandler(filters.Document.ALL,               handle_csv_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,    handle_card_search_v4))
