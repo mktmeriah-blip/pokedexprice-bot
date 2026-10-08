@@ -623,6 +623,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• `/add Charizard` → Tambah ke koleksi\n"
         "• `/inventory` → Lihat semua koleksi\n"
         "• `/refresh` → Update harga semua kartu\n"
+        "• `/editprice 1 25\\.5` → Edit harga manual kartu\n"
         "• `/delete 1` → Hapus kartu nomor 1\n"
         "• `/setcondition 1 Mint` → Set kondisi kartu\n"
         "• `/setgrade 1 PSA 10` → Set grade PSA/BGS\n"
@@ -3069,6 +3070,65 @@ async def check_wishlist_targets(context) -> None:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FITUR BARU v6
+
+# ── /editprice <id> <harga_usd> — Edit harga manual kartu di inventory ────────
+async def edit_price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    args    = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⚠️ Format: `/editprice <id> <harga_usd>`\n"
+            "Contoh: `/editprice 3 25.5`\n\n"
+            "_Gunakan /inventory untuk lihat ID kartu\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        inv_id    = int(args[0])
+        new_price = float(args[1].replace(",", "."))
+        if new_price < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID harus angka bulat, harga harus angka positif\\.\nContoh: `/editprice 3 25\\.5`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    new_idr = new_price * EXCHANGE_RATE
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd FROM inventory WHERE id=? AND user_id=?",
+            (inv_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text(
+                f"❌ Kartu ID \\#{inv_id} tidak ditemukan di inventory kamu\\.",
+                parse_mode="MarkdownV2",
+            )
+            return
+        card_name, card_set, old_price = row
+        await db.execute(
+            "UPDATE inventory SET price_usd=?, price_idr=? WHERE id=? AND user_id=?",
+            (new_price, new_idr, inv_id, user_id),
+        )
+        await db.commit()
+
+    diff      = new_price - (old_price or 0)
+    diff_sign = f"\\+${diff:.2f}" if diff >= 0 else f"\\-${abs(diff):.2f}"
+    diff_tag  = f"📈 {diff_sign}" if diff > 0 else (f"📉 {diff_sign}" if diff < 0 else "➡️ Sama")
+
+    await update.message.reply_text(
+        f"✅ *Harga diupdate\\!*\n\n"
+        f"🃏 *{esc(card_name)}* _{esc(card_set or '')}_\n"
+        f"ID: \\#{inv_id}\n\n"
+        f"Harga lama: \\${old_price:.2f}\n"
+        f"Harga baru: *\\${new_price:.2f}* \\(Rp {new_idr:,.0f}\\)\n"
+        f"Selisih: {diff_tag}",
+        parse_mode="MarkdownV2",
+    )
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── 1. /hargalokal <nama> — Harga marketplace Tokopedia ──────────────────────
@@ -3434,6 +3494,7 @@ def main() -> None:
     app.add_handler(CommandHandler("hargalokal",   harga_lokal_cmd))
     app.add_handler(CommandHandler("portohistory", porto_history_cmd))
     app.add_handler(CommandHandler("saraanjual",   saran_jual_cmd))
+    app.add_handler(CommandHandler("editprice",    edit_price_cmd))
 
     app.add_handler(CallbackQueryHandler(handle_snap_save,   pattern=r"^snap_(save|buy|wish):"))
     app.add_handler(CallbackQueryHandler(handle_card_select, pattern=r"^card_select:"))
