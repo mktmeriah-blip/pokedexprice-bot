@@ -931,8 +931,7 @@ async def handle_ocr_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text("⚠️ Data expired, kirim foto lagi bre\\.", parse_mode="MarkdownV2")
         return
     # Langsung minta harga, tidak perlu cari API
-    context.bot_data[f"pending_manual_name_{user_id}"] = name
-    context.bot_data[f"pending_manual_price_{user_id}"] = True
+    context.bot_data[f"pending_manual_price_{user_id}"] = name  # simpan nama langsung
     await query.message.reply_text(
         f"✅ Nama kartu: *{esc(name)}*\n\n"
         f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
@@ -2411,22 +2410,15 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
             )
         return
 
-    # ── Cek pending_manual_price: user ketik harga IDR setelah klik Simpan Manual ──
-    pending_manual = context.bot_data.get(f"pending_manual_price_{user_id}")
-    if pending_manual is not None:
-        # Nama bisa tersimpan langsung di key ini (alur lama) atau di pending_manual_name (alur foto)
-        if pending_manual is True:
-            card_name = context.bot_data.pop(f"pending_manual_name_{user_id}", None)
-        else:
-            card_name = pending_manual
-        if not card_name:
-            del context.bot_data[f"pending_manual_price_{user_id}"]
-            await update.message.reply_text("⚠️ Data expired, kirim foto lagi bre\\.", parse_mode="MarkdownV2")
-            return
+    # ── Cek pending_manual_price: user ketik harga IDR ──────────────────────────
+    card_name_pending = context.bot_data.get(f"pending_manual_price_{user_id}")
+    if card_name_pending and isinstance(card_name_pending, str):
         try:
             price_idr = float(re.sub(r'[^\d.]', '', text))
+            if price_idr <= 0:
+                raise ValueError("harga nol")
             price_usd = round(price_idr / EXCHANGE_RATE, 2)
-            data      = {"name": card_name, "price_idr": price_idr, "price_usd": price_usd}
+            data      = {"name": card_name_pending, "price_idr": price_idr, "price_usd": price_usd}
             del context.bot_data[f"pending_manual_price_{user_id}"]
             context.bot_data[f"pending_manual_confirm_{user_id}"] = data
             await _show_manual_confirm(update.message, user_id, data)
@@ -2440,8 +2432,7 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     # ── Cek pending_photo_name: user ketik nama manual setelah foto ──────────────
     if context.bot_data.pop(f"pending_photo_name_{user_id}", False):
         # Langsung minta harga, tidak perlu cari API
-        context.bot_data[f"pending_manual_name_{user_id}"] = text
-        context.bot_data[f"pending_manual_price_{user_id}"] = True
+        context.bot_data[f"pending_manual_price_{user_id}"] = text  # simpan nama langsung
         await update.message.reply_text(
             f"✅ Nama kartu: *{esc(text)}*\n\n"
             f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
