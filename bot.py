@@ -843,6 +843,17 @@ async def handle_manual_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text("❌ Dibatalkan\\.", parse_mode="MarkdownV2")
 
 # ── OCR: baca nama kartu dari foto label PSA ─────────────────────────────────
+def _clean_ocr_line(text: str) -> str:
+    """Buang karakter noise OCR: |, 1 di awal, karakter non-huruf selain spasi."""
+    # Buang karakter pipa, angka junk, tanda baca di sekitar huruf
+    text = re.sub(r"[|\\/*_@#$%^&]", " ", text)
+    # Buang angka yang berdiri sendiri di awal/akhir (bukan bagian nama)
+    text = re.sub(r"^\d+\s+", "", text)
+    text = re.sub(r"\s+\d+$", "", text)
+    # Collapse spasi ganda
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 def ocr_card_label(photo_bytes: bytes) -> str | None:
     """Baca nama kartu dari foto PSA/label pakai Tesseract OCR."""
     if not HAS_TESSERACT:
@@ -851,42 +862,58 @@ def ocr_card_label(photo_bytes: bytes) -> str | None:
         image = Image.open(io.BytesIO(photo_bytes))
         w, h  = image.size
 
-        # Crop area label: ambil 40% atas, 72% kiri (hindari kolom grade kanan)
-        label = image.crop((0, 0, int(w * 0.72), int(h * 0.42)))
+        # Crop area label: ambil 38% atas, 70% kiri
+        label = image.crop((int(w * 0.01), int(h * 0.03), int(w * 0.70), int(h * 0.40)))
 
-        # Upscale 2x supaya OCR lebih akurat
-        label = label.resize((label.width * 2, label.height * 2), Image.LANCZOS)
+        # Upscale 3x supaya OCR lebih akurat pada label kecil
+        label = label.resize((label.width * 3, label.height * 3), Image.LANCZOS)
 
-        # Grayscale + sharpen + contrast
+        # Grayscale + sharpen + contrast tinggi
         label = label.convert("L")
+        label = ImageEnhance.Contrast(label).enhance(3.0)
         label = label.filter(ImageFilter.SHARPEN)
-        label = ImageEnhance.Contrast(label).enhance(2.5)
+        label = label.filter(ImageFilter.SHARPEN)
 
-        raw = pytesseract.image_to_string(label, config="--psm 6 --oem 3")
-        lines = [l.strip() for l in raw.strip().splitlines() if len(l.strip()) >= 3]
+        raw = pytesseract.image_to_string(label, config="--psm 4 --oem 3")
+        lines = [_clean_ocr_line(l) for l in raw.strip().splitlines()]
+        lines = [l for l in lines if len(l) >= 3 and re.search(r"[a-zA-Z]", l)]
 
         if not lines:
             return None
+
+        SKIP_WORDS = {"GEM", "MT", "NM", "PSA", "AUTHENTIC", "MINT", "NEAR",
+                      "POOR", "FAIR", "GOOD", "VG", "EX", "NM", "PR", "FR"}
 
         # Cari baris "POKEMON" → baris berikutnya adalah nama kartu
         for i, line in enumerate(lines):
             if "POKEMON" in line.upper() or "POKÉMON" in line.upper():
                 name_parts = []
-                for j in range(i + 1, min(i + 3, len(lines))):
+                for j in range(i + 1, min(i + 4, len(lines))):
                     nl = lines[j].strip()
-                    # Skip baris yang isinya angka saja (cert number, grade)
-                    if re.sub(r"[^a-zA-Z]", "", nl) and len(nl) >= 3:
-                        # Skip kata meta-grade
-                        skip = {"GEM", "MT", "NM", "PSA", "AUTHENTIC", "MINT"}
-                        words = nl.upper().split()
-                        if not all(w in skip for w in words):
-                            name_parts.append(nl.strip())
+                    if len(nl) < 3:
+                        continue
+                    words = nl.upper().split()
+                    # Skip baris yang semua katanya adalah kata grade/meta
+                    if all(w in SKIP_WORDS for w in words):
+                        continue
+                    # Baris pertama setelah POKEMON = nama kartu utama
+                    name_parts.append(nl)
+                    # Baris kedua boleh diambil kalau ada dan tidak seperti sertifikat
+                    if len(name_parts) == 1 and j + 1 < len(lines):
+                        next_line = lines[j + 1].strip()
+                        if (len(next_line) >= 3
+                                and re.search(r"[a-zA-Z]", next_line)
+                                and not re.match(r"^\d+$", next_line.replace(" ", ""))):
+                            name_parts.append(next_line)
+                    break
                 if name_parts:
-                    return " ".join(name_parts).title()
+                    result = " ".join(name_parts).title()
+                    return result
 
-        # Fallback: baris non-angka pertama
+        # Fallback: baris non-angka pertama yang punya cukup huruf
         for line in lines:
-            if re.sub(r"[^a-zA-Z]", "", line) and not re.match(r"^[\d\s#]+$", line):
+            letters = re.sub(r"[^a-zA-Z]", "", line)
+            if len(letters) >= 4:
                 return line.title()
 
         return None
@@ -2387,10 +2414,19 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     # ── Cek pending_manual_price: user ketik harga IDR setelah klik Simpan Manual ──
     pending_manual = context.bot_data.get(f"pending_manual_price_{user_id}")
     if pending_manual is not None:
+        # Nama bisa tersimpan langsung di key ini (alur lama) atau di pending_manual_name (alur foto)
+        if pending_manual is True:
+            card_name = context.bot_data.pop(f"pending_manual_name_{user_id}", None)
+        else:
+            card_name = pending_manual
+        if not card_name:
+            del context.bot_data[f"pending_manual_price_{user_id}"]
+            await update.message.reply_text("⚠️ Data expired, kirim foto lagi bre\\.", parse_mode="MarkdownV2")
+            return
         try:
             price_idr = float(re.sub(r'[^\d.]', '', text))
             price_usd = round(price_idr / EXCHANGE_RATE, 2)
-            data      = {"name": pending_manual, "price_idr": price_idr, "price_usd": price_usd}
+            data      = {"name": card_name, "price_idr": price_idr, "price_usd": price_usd}
             del context.bot_data[f"pending_manual_price_{user_id}"]
             context.bot_data[f"pending_manual_confirm_{user_id}"] = data
             await _show_manual_confirm(update.message, user_id, data)
