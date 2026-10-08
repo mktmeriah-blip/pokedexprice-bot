@@ -582,7 +582,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"Halo, {name}\\! ⚡\n"
             "Bot Pokémon TCG Portfolio & Vision Scanner aktif\\!\n\n"
-            "📸 *Fitur Scan:* Kirim foto kartu → AI baca nama, cek harga otomatis\\!\n"
             "🃏 *Multi\\-Card Scan:* Foto banyak kartu → semua harga keluar\\!\n\n"
             "📖 *Perintah:*\n"
             "• Ketik nama kartu → Cek harga\n"
@@ -617,7 +616,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🔍 *CEK HARGA*\n"
         "• Ketik nama kartu → cari & lihat harga\n"
-        "• Kirim 📸 foto kartu → AI scan otomatis\n"
         "• Setelah cek harga muncul tombol simpan\\!\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📦 *INVENTORY*\n"
