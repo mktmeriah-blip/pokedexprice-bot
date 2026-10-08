@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import csv
 import difflib
 import io
@@ -12,7 +11,6 @@ from datetime import datetime, timedelta
 import aiosqlite
 import httpx
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from pathlib import Path
 from PIL import Image
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -41,21 +39,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN")
 EXCHANGE_RATE       = int(os.getenv("EXCHANGE_RATE", 16000))
 DB_PATH             = os.getenv("DB_PATH", "pokemon_inventory.db")
-OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "google/gemini-flash-1.5")
-OPENROUTER_FALLBACK = os.getenv("OPENROUTER_FALLBACK", "meta-llama/llama-3.2-11b-vision-instruct:free")
 POKEMON_TCG_API_KEY = os.getenv("POKEMON_TCG_API_KEY", "")
 
-if not OPENROUTER_API_KEY or not TELEGRAM_TOKEN:
-    raise RuntimeError("OPENROUTER_API_KEY dan TELEGRAM_TOKEN wajib diisi di .env!")
-
-openrouter_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN wajib diisi di .env!")
 
 CARD_CONDITIONS = [
     "Mint", "Near Mint", "Lightly Played",
@@ -684,13 +674,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 # ── Helper: compress image ────────────────────────────────────────────────────
-async def compress_image(photo_bytes: bytearray) -> bytes:
-    image = Image.open(io.BytesIO(photo_bytes))
-    image.thumbnail((1024, 1024))
-    buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
-
 # ── Helper: parse card names + kondisi dari AI ───────────────────────────────
 def parse_card_names(raw: str) -> list[str]:
     """Backward-compat: return list of names only."""
@@ -734,132 +717,16 @@ def parse_card_names_with_condition(raw: str) -> list[tuple[str, str]]:
             results.append((name, cond))
     return results
 
-# ── Handler foto (MULTI-CARD) ─────────────────────────────────────────────────
+# ── Handler foto ─────────────────────────────────────────────────────────────
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    status = await update.message.reply_text(
-        "🤖 Foto diterima\\! Sedang dianalisis AI\\.\\.\\.",
-        parse_mode="MarkdownV2"
+    user_id = update.effective_user.id
+    context.bot_data[f"pending_photo_name_{user_id}"] = True
+    await update.message.reply_text(
+        "📸 Foto diterima\\!\n\n"
+        "📝 *Ketik nama kartunya bre*, nanti bot cari harga otomatis\\!\n"
+        "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
+        parse_mode="MarkdownV2",
     )
-    try:
-        photo_file  = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
-        compressed  = await compress_image(photo_bytes)
-        image_b64   = base64.b64encode(compressed).decode("utf-8")
-
-        VISION_PROMPT = (
-            "Identifikasi SEMUA kartu Pokémon yang terlihat dalam foto ini. "
-            "Untuk setiap kartu, tulis dalam format TEPAT ini (satu baris per kartu):\n"
-            "NAMA: <nama kartu> | KONDISI: <Mint/Near Mint/Lightly Played/Moderately Played/Heavily Played/Damaged>\n"
-            "Contoh:\nNAMA: Charizard VMAX | KONDISI: Near Mint\nNAMA: Pikachu ex | KONDISI: Lightly Played\n"
-            "Nilai kondisi berdasarkan: goresan, kusut, tepi kartu, permukaan. "
-            "Jika tidak bisa menilai kondisi, tulis Near Mint. "
-            "JANGAN tambahkan keterangan lain selain format di atas."
-        )
-        VISION_MSG = [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text", "text": VISION_PROMPT},
-            ],
-        }]
-
-        # Coba model utama, fallback ke model cadangan jika gagal
-        raw_text = None
-        for model_try in [OPENROUTER_MODEL, OPENROUTER_FALLBACK]:
-            try:
-                resp = await openrouter_client.chat.completions.create(
-                    model=model_try, messages=VISION_MSG, max_tokens=1024
-                )
-                raw_text = resp.choices[0].message.content if resp.choices else None
-                if raw_text:
-                    break
-            except Exception as model_err:
-                logger.warning(f"Model {model_try} gagal: {model_err}")
-                continue
-        if not raw_text:
-            await status.edit_text("❌ AI gagal membaca gambar\\. Coba foto lebih jelas ya Bre\\!", parse_mode="MarkdownV2")
-            return
-
-        card_pairs = parse_card_names_with_condition(raw_text)
-        if not card_pairs:
-            await status.edit_text("❌ Tidak ada kartu Pokémon terdeteksi\\. Coba foto lebih jelas\\!", parse_mode="MarkdownV2")
-            return
-
-        card_names = [name for name, _ in card_pairs]
-        card_conds = [cond for _, cond in card_pairs]
-
-        COND_EMOJI = {
-            "Mint": "🟢", "Near Mint": "🟢", "Lightly Played": "🟡",
-            "Moderately Played": "🟠", "Heavily Played": "🔴", "Damaged": "⚫",
-        }
-        count = len(card_names)
-        if count == 1:
-            cond_tag = f" \\| {COND_EMOJI.get(card_conds[0], '')} *{esc(card_conds[0])}*"
-            await status.edit_text(
-                f"🔍 AI mendeteksi: *{esc(card_names[0])}*{cond_tag}\nSedang cari harga\\.\\.\\.",
-                parse_mode="MarkdownV2",
-            )
-        else:
-            names_preview = "\n".join(
-                f"• {esc(n)} {COND_EMOJI.get(c, '')} _{esc(c)}_"
-                for n, c in card_pairs
-            )
-            await status.edit_text(
-                f"🃏 AI mendeteksi *{count} kartu*:\n{names_preview}\n\nSedang cek semua harga\\.\\.\\.",
-                parse_mode="MarkdownV2",
-            )
-
-        tasks   = [search_pokemon_card(name) for name in card_names]
-        results = await asyncio.gather(*tasks)
-
-        found_count = 0
-        for name, card in zip(card_names, results):
-            if card is None:
-                await update.message.reply_text(f"❌ *{esc(name)}* tidak ditemukan\\.", parse_mode="MarkdownV2")
-                continue
-            if isinstance(card, dict) and card.get("error"):
-                err = card["error"]
-                msg = "⚠️ Rate limit\\!" if err == "rate_limit" else "⏱️ Timeout\\!" if err == "timeout" else "🔧 API down, coba lagi\\!" if err == "api_down" else "❌ Gagal fetch data\\!"
-                await update.message.reply_text(f"{msg} \\({esc(name)}\\)", parse_mode="MarkdownV2")
-                continue
-            cond  = card_conds[list(card_names).index(name)] if name in card_names else "Near Mint"
-            label = f"Scan Foto • {cond}" if count == 1 else f"Scan {found_count + 1}/{count} • {cond}"
-            await send_card(update, card, label=label, context=context, show_save_buttons=True)
-            found_count += 1
-
-        if count > 1 and found_count > 0:
-            valid     = [r for r in results if r and not (isinstance(r, dict) and r.get("error"))]
-            total_usd = sum(r.get("price_usd", 0) for r in valid)
-            total_idr = total_usd * EXCHANGE_RATE
-            await update.message.reply_text(
-                f"📊 *Ringkasan:* {found_count}/{count} kartu ditemukan\n"
-                f"💵 Total: \\${total_usd:.2f} \\| Rp {total_idr:,.0f}",
-                parse_mode="MarkdownV2",
-            )
-
-    except Exception as e:
-        logger.error(f"Error processing photo: {e}", exc_info=True)
-        err_str = str(e)
-        # Tampilkan error spesifik + fallback manual
-        if "rate" in err_str.lower() or "429" in err_str:
-            hint = "⚠️ AI lagi limit bre, coba beberapa menit lagi\\."
-        elif "timeout" in err_str.lower() or "connect" in err_str.lower():
-            hint = "⏱️ Koneksi ke AI timeout\\."
-        elif "api" in err_str.lower() or "auth" in err_str.lower() or "key" in err_str.lower():
-            hint = "🔑 API key OpenRouter bermasalah\\. Cek file \\. env kamu\\."
-        else:
-            hint = f"❌ Error: `{esc(err_str[:120])}`"
-
-        user_id = update.effective_user.id
-        context.bot_data[f"pending_photo_name_{user_id}"] = True
-
-        await status.edit_text(
-            f"{hint}\n\n"
-            "📝 *Mau tetap simpan kartu ini?*\n"
-            "Ketik nama kartunya manual bre, nanti bot cari harganya\\!\n"
-            "_Contoh: `Pikachu ex` atau `Charizard VMAX`_",
-            parse_mode="MarkdownV2",
-        )
 
 # ── Handler teks ──────────────────────────────────────────────────────────────
 async def handle_card_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
