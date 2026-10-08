@@ -401,38 +401,129 @@ def _extract_card(card: dict) -> dict:
     }
 
 # ── Format pesan kartu ────────────────────────────────────────────────────────
-def card_message(card: dict, label: str = "") -> str:
+def card_message(card: dict, label: str = "", show_save_hint: bool = False) -> str:
     suffix    = f" \\({label}\\)" if label else ""
     price_usd = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "Tidak tersedia"
     price_idr = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "Tidak tersedia"
+    hint = "\n💡 _Tekan tombol di bawah untuk simpan ke inventory_" if show_save_hint else \
+           f"\n💡 _Mau simpan? Ketik: /add {esc(card['name'])}_"
     return (
         f"✨ *{esc(card['name'])}*{suffix} ✨\n"
         f"📦 Set: {esc(card['set'])}\n"
         f"⭐ Rarity: {esc(card['rarity'])}\n\n"
         f"💰 *Estimasi Harga:*\n"
         f"• Internasional: {price_usd}\n"
-        f"• Pasaran Lokal \\(IDR\\): {price_idr}\n\n"
-        f"💡 _Mau simpan? Ketik: /add {esc(card['name'])}_"
+        f"• Pasaran Lokal \\(IDR\\): {price_idr}"
+        f"{hint}"
     )
 
-async def send_card(update: Update, card: dict, label: str = "") -> None:
-    msg = card_message(card, label)
+async def send_card(
+    update: Update,
+    card: dict,
+    label: str = "",
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+    show_save_buttons: bool = False,
+) -> None:
+    """Kirim info kartu. Jika show_save_buttons=True, tampilkan tombol simpan ke inventory."""
+    import uuid as _uuid
+
+    markup = None
+    if show_save_buttons and context is not None:
+        key = _uuid.uuid4().hex[:12]
+        context.bot_data[f"card_snap_{key}"] = card
+        markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("💾 Simpan ke Inventory",   callback_data=f"snap_save:{key}"),
+                InlineKeyboardButton("💰 Simpan + Set Modal",    callback_data=f"snap_buy:{key}"),
+            ],
+            [
+                InlineKeyboardButton("⭐ Simpan ke Wishlist",    callback_data=f"snap_wish:{key}"),
+            ],
+        ])
+
+    msg = card_message(card, label, show_save_hint=show_save_buttons)
     try:
         if card.get("image"):
-            await update.message.reply_photo(photo=card["image"], caption=msg, parse_mode="MarkdownV2")
+            await update.message.reply_photo(
+                photo=card["image"], caption=msg,
+                parse_mode="MarkdownV2", reply_markup=markup,
+            )
         else:
-            await update.message.reply_text(msg, parse_mode="MarkdownV2")
+            await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=markup)
     except Exception as e:
         logger.error(f"MarkdownV2 error, fallback plain: {e}")
         plain = (
             f"✨ {card['name']} ✨\nSet: {card['set']}\nRarity: {card['rarity']}\n\n"
-            f"Harga: ${card['price_usd']:.2f} | Rp {card['price_idr']:,.0f}\n"
-            f"Mau simpan? Ketik: /add {card['name']}"
+            f"Harga: ${card['price_usd']:.2f} | Rp {card['price_idr']:,.0f}"
         )
         if card.get("image"):
-            await update.message.reply_photo(photo=card["image"], caption=plain)
+            await update.message.reply_photo(photo=card["image"], caption=plain, reply_markup=markup)
         else:
-            await update.message.reply_text(plain)
+            await update.message.reply_text(plain, reply_markup=markup)
+
+
+# ── Callback: Simpan dari foto/scan langsung ──────────────────────────────────
+async def handle_snap_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    await query.answer()
+    data    = query.data   # "snap_save:{key}" | "snap_buy:{key}" | "snap_wish:{key}"
+    parts   = data.split(":", 1)
+    action  = parts[0]
+    key     = parts[1] if len(parts) > 1 else ""
+    user_id = update.effective_user.id
+
+    card = context.bot_data.get(f"card_snap_{key}")
+    if not card:
+        await query.answer("⚠️ Data kartu sudah expired, cari ulang.", show_alert=True)
+        return
+
+    if action == "snap_wish":
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO wishlist (user_id, card_name, card_set, price_usd, price_idr) VALUES (?,?,?,?,?)",
+                (user_id, card["name"], card["set"], card["price_usd"], card["price_idr"]),
+            )
+            await db.commit()
+        await query.message.reply_text(
+            f"⭐ *{esc(card['name'])}* ditambahkan ke wishlist\\!",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    # snap_save atau snap_buy → simpan ke inventory
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO inventory (user_id, card_name, card_set, price_usd, price_idr, condition) VALUES (?,?,?,?,?,?)",
+            (user_id, card["name"], card["set"], card["price_usd"], card["price_idr"], "Near Mint"),
+        )
+        new_id = cur.lastrowid
+        await db.execute(
+            "INSERT INTO price_history (user_id, card_name, card_set, price_usd, price_idr) VALUES (?,?,?,?,?)",
+            (user_id, card["name"], card["set"], card["price_usd"], card["price_idr"]),
+        )
+        await db.commit()
+
+    price_str = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+    idr_str   = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "N/A"
+
+    if action == "snap_save":
+        await query.message.reply_text(
+            f"✅ *{esc(card['name'])}* disimpan\\! \\(ID: {new_id}\\)\n\n"
+            f"💵 {price_str} \\| {idr_str}\n\n"
+            f"📌 Set harga beli: `/buyprice {new_id} \\<harga\\>`\n"
+            f"💰 Jual nanti: `/jual {new_id} \\<harga\\_jual\\>`",
+            parse_mode="MarkdownV2",
+        )
+
+    elif action == "snap_buy":
+        # Simpan pending state → tunggu user kirim harga beli
+        context.bot_data[f"pending_buy_{user_id}"] = new_id
+        await query.message.reply_text(
+            f"✅ *{esc(card['name'])}* disimpan\\! \\(ID: {new_id}\\)\n\n"
+            f"💸 *Berapa harga beli kartu ini \\(USD\\)?*\n"
+            f"Ketik nominalnya sekarang, contoh: `12\\.5`",
+            parse_mode="MarkdownV2",
+        )
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -651,7 +742,7 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(f"{msg} \\({esc(name)}\\)", parse_mode="MarkdownV2")
                 continue
             label = "Scan Foto" if count == 1 else f"Scan {found_count + 1}/{count}"
-            await send_card(update, card, label=label)
+            await send_card(update, card, label=label, context=context, show_save_buttons=True)
             found_count += 1
 
         if count > 1 and found_count > 0:
@@ -695,7 +786,7 @@ async def handle_card_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if len(results) == 1:
-        await send_card(update, results[0])
+        await send_card(update, results[0], context=context, show_save_buttons=True)
         return
 
     keyboard = []
@@ -729,27 +820,8 @@ async def handle_card_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     card = cards[idx]
     await query.edit_message_text(f"✅ Kamu pilih: *{esc(card['name'])}*", parse_mode="MarkdownV2")
 
-    msg   = card_message(card)
-    plain = (
-        f"✨ {card['name']}\nSet: {card['set']}\nRarity: {card['rarity']}\n"
-        f"Harga: ${card['price_usd']:.2f} | Rp {card['price_idr']:,.0f}\n"
-        f"Mau simpan? Ketik: /add {card['name']}"
-    )
-    try:
-        if card.get("image"):
-            await query.message.reply_photo(photo=card["image"], caption=msg, parse_mode="MarkdownV2")
-        else:
-            await query.message.reply_text(msg, parse_mode="MarkdownV2")
-    except Exception as e:
-        logger.error(f"MarkdownV2 error, trying plain fallback: {e}")
-        try:
-            if card.get("image"):
-                await query.message.reply_photo(photo=card["image"], caption=plain)
-            else:
-                await query.message.reply_text(plain)
-        except Exception as e2:
-            logger.error(f"Photo fallback also failed: {e2}")
-            await query.message.reply_text(plain)
+    # Tampilkan kartu dengan tombol simpan
+    await send_card(query, card, context=context, show_save_buttons=True)
 
 # ── /add ──────────────────────────────────────────────────────────────────────
 async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2074,7 +2146,33 @@ async def get_autocomplete_suggestions(query: str, limit: int = 5) -> list[str]:
 
 # ── Patch handle_card_search → tambah autocomplete saat tidak ditemukan ───────
 async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.message.text.strip()
+    user_id = update.effective_user.id
+    text    = update.message.text.strip()
+
+    # ── Cek pending_buy: user balas harga modal setelah klik "Simpan + Set Modal" ──
+    pending_id = context.bot_data.get(f"pending_buy_{user_id}")
+    if pending_id is not None:
+        try:
+            buy_usd = float(text.replace(",", "."))
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE inventory SET buy_price_usd=? WHERE id=? AND user_id=?",
+                    (buy_usd, pending_id, user_id),
+                )
+                await db.commit()
+            buy_idr = buy_usd * EXCHANGE_RATE
+            del context.bot_data[f"pending_buy_{user_id}"]
+            await update.message.reply_text(
+                f"✅ Modal disimpan\\!\n"
+                f"💵 *${buy_usd:.2f}* \\(Rp {buy_idr:,.0f}\\) untuk inventory ID *#{pending_id}*\\.\n"
+                f"_Gunakan /jual {pending_id} \\<harga\\> kalau mau jual nanti\\._",
+                parse_mode="MarkdownV2",
+            )
+            return
+        except ValueError:
+            pass  # bukan angka → lanjut ke pencarian biasa
+
+    query = text
     await update.message.reply_text(f"🔍 Mencari kartu *{esc(query)}*\\.\\.\\.", parse_mode="MarkdownV2")
 
     results = await search_pokemon_cards_multi(query, limit=5)
@@ -2959,11 +3057,12 @@ def main() -> None:
     app.add_handler(CommandHandler("synccards",     sync_cards_cmd))
     app.add_handler(CommandHandler("cari",          cari_lokal))
 
+    app.add_handler(CallbackQueryHandler(handle_snap_save,   pattern=r"^snap_(save|buy|wish):"))
     app.add_handler(CallbackQueryHandler(handle_card_select, pattern=r"^card_select:"))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo_search))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_card_search_v4))
 
-    logger.info("Bot Pokémon Vision & Portfolio v4 aktif! (+gen, newsets, newcards, synccards, cari, autocomplete)")
+    logger.info("Bot Pokémon Vision & Portfolio v5 aktif! (+foto→simpan, tombol inventory/wishlist)")
     app.run_polling()
 
 if __name__ == "__main__":
