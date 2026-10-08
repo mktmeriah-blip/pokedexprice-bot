@@ -219,6 +219,8 @@ async def search_pokemon_card(card_name: str) -> dict | None:
             r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
+            if r.status_code >= 500:
+                return {"error": "api_down"}
             r.raise_for_status()
             cards_list = r.json().get("data")
 
@@ -239,6 +241,10 @@ async def search_pokemon_card(card_name: str) -> dict | None:
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code >= 500:
+            return {"error": "api_down"}
+        return {"error": f"http_{e.response.status_code}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -253,6 +259,8 @@ async def search_pokemon_cards_multi(card_name: str, limit: int = 5) -> list | d
             r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
+            if r.status_code >= 500:
+                return {"error": "api_down"}
             r.raise_for_status()
             cards_list = r.json().get("data")
 
@@ -264,6 +272,10 @@ async def search_pokemon_cards_multi(card_name: str, limit: int = 5) -> list | d
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code >= 500:
+            return {"error": "api_down"}
+        return {"error": f"http_{e.response.status_code}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -275,6 +287,8 @@ async def search_pokemon_set(set_name: str, limit: int = 100) -> dict | None:
             r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
+            if r.status_code >= 500:
+                return {"error": "api_down"}
             r.raise_for_status()
             data       = r.json()
             cards_list = data.get("data", [])
@@ -288,6 +302,10 @@ async def search_pokemon_set(set_name: str, limit: int = 100) -> dict | None:
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code >= 500:
+            return {"error": "api_down"}
+        return {"error": f"http_{e.response.status_code}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -300,6 +318,8 @@ async def search_all_versions(card_name: str) -> list | dict | None:
             r = await http.get(url, headers=_tcg_headers())
             if r.status_code == 429:
                 return {"error": "rate_limit"}
+            if r.status_code >= 500:
+                return {"error": "api_down"}
             r.raise_for_status()
             cards_list = r.json().get("data", [])
 
@@ -313,6 +333,10 @@ async def search_all_versions(card_name: str) -> list | dict | None:
 
     except httpx.TimeoutException:
         return {"error": "timeout"}
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code >= 500:
+            return {"error": "api_down"}
+        return {"error": f"http_{e.response.status_code}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -585,7 +609,7 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 continue
             if isinstance(card, dict) and card.get("error"):
                 err = card["error"]
-                msg = "⚠️ Rate limit\\!" if err == "rate_limit" else f"⏱️ Timeout\\!" if err == "timeout" else f"❌ Error: {esc(err)}"
+                msg = "⚠️ Rate limit\\!" if err == "rate_limit" else "⏱️ Timeout\\!" if err == "timeout" else "🔧 API down, coba lagi\\!" if err == "api_down" else "❌ Gagal fetch data\\!"
                 await update.message.reply_text(f"{msg} \\({esc(name)}\\)", parse_mode="MarkdownV2")
                 continue
             label = "Scan Foto" if count == 1 else f"Scan {found_count + 1}/{count}"
@@ -622,8 +646,14 @@ async def handle_card_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("⚠️ API rate limit, tunggu sebentar\\!", parse_mode="MarkdownV2")
         elif err == "timeout":
             await update.message.reply_text("⏱️ Timeout\\! Coba lagi ya\\.", parse_mode="MarkdownV2")
+        elif err == "api_down":
+            await update.message.reply_text(
+                "🔧 Pokemontcg\\.io lagi gangguan bre\\! Server mereka down sementara\\.\n"
+                "Coba lagi beberapa menit lagi ya\\! 🙏",
+                parse_mode="MarkdownV2"
+            )
         else:
-            await update.message.reply_text(f"❌ Error: {esc(err)}", parse_mode="MarkdownV2")
+            await update.message.reply_text("❌ Gagal fetch data kartu bre, coba lagi\\!", parse_mode="MarkdownV2")
         return
 
     if len(results) == 1:
@@ -1145,7 +1175,7 @@ async def scan_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if isinstance(result, dict) and result.get("error"):
         err = result["error"]
-        msg = "⚠️ Rate limit\\!" if err == "rate_limit" else "⏱️ Timeout\\!" if err == "timeout" else f"❌ Error: {esc(err)}"
+        msg = "⚠️ Rate limit\\!" if err == "rate_limit" else "⏱️ Timeout\\!" if err == "timeout" else "🔧 Pokemontcg\\.io lagi gangguan bre\\! Coba lagi nanti ya\\." if err == "api_down" else "❌ Gagal fetch data kartu bre, coba lagi\\!"
         await update.message.reply_text(msg, parse_mode="MarkdownV2")
         return
 
@@ -1295,7 +1325,9 @@ async def find_cheap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"❌ '{esc(card_name)}' tidak ditemukan di manapun\\.", parse_mode="MarkdownV2")
         return
     if isinstance(results, dict) and results.get("error"):
-        await update.message.reply_text(f"❌ Error: {esc(results['error'])}", parse_mode="MarkdownV2")
+        err = results["error"]
+        msg = "⚠️ Rate limit\\!" if err == "rate_limit" else "⏱️ Timeout\\!" if err == "timeout" else "🔧 Pokemontcg\\.io lagi gangguan bre\\! Coba lagi nanti ya\\." if err == "api_down" else "❌ Gagal fetch data kartu bre, coba lagi\\!"
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
         return
 
     with_price = [r for r in results if r["price_usd"] > 0]
