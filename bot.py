@@ -89,8 +89,9 @@ async def init_db() -> None:
             )
         """)
         for col, definition in [
-            ("condition", "TEXT DEFAULT 'Near Mint'"),
-            ("psa_grade",  "TEXT DEFAULT NULL"),
+            ("condition",     "TEXT DEFAULT 'Near Mint'"),
+            ("psa_grade",     "TEXT DEFAULT NULL"),
+            ("buy_price_usd", "REAL DEFAULT 0.0"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE inventory ADD COLUMN {col} {definition}")
@@ -99,15 +100,20 @@ async def init_db() -> None:
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS wishlist (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id   INTEGER NOT NULL,
-                card_name TEXT    NOT NULL,
-                card_set  TEXT,
-                price_usd REAL    DEFAULT 0.0,
-                price_idr REAL    DEFAULT 0.0,
-                added_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id          INTEGER NOT NULL,
+                card_name        TEXT    NOT NULL,
+                card_set         TEXT,
+                price_usd        REAL    DEFAULT 0.0,
+                price_idr        REAL    DEFAULT 0.0,
+                target_price_usd REAL    DEFAULT 0.0,
+                added_at         TEXT    DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        try:
+            await db.execute("ALTER TABLE wishlist ADD COLUMN target_price_usd REAL DEFAULT 0.0")
+        except Exception:
+            pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS price_history (
@@ -140,6 +146,21 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
                 lang    TEXT DEFAULT 'id'
+            )
+        """)
+
+        # ── Trade log (fitur /jual) ────────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trade_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER NOT NULL,
+                card_name     TEXT    NOT NULL,
+                card_set      TEXT,
+                sell_price_usd REAL   DEFAULT 0.0,
+                sell_price_idr REAL   DEFAULT 0.0,
+                buy_price_usd  REAL   DEFAULT 0.0,
+                profit_usd     REAL   DEFAULT 0.0,
+                sold_at        TEXT   DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -1897,6 +1918,506 @@ async def export_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parse_mode="MarkdownV2",
     )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── FITUR BARU v3 ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── /buyprice <id> <harga_usd> ────────────────────────────────────────────────
+async def set_buyprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Format: `/buyprice \\<id\\> \\<harga_usd\\>`\n"
+            "Contoh: `/buyprice 3 12\\.5`\n"
+            "_Lihat ID kartu di /inventory_",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    try:
+        card_id   = int(context.args[0])
+        buy_price = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID dan harga harus berupa angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await update.message.reply_text("❌ Kartu tidak ditemukan di inventory kamu\\.", parse_mode="MarkdownV2")
+            return
+
+        card_name, card_set, market_usd = row
+        await db.execute(
+            "UPDATE inventory SET buy_price_usd=? WHERE id=? AND user_id=?",
+            (buy_price, card_id, user_id),
+        )
+        await db.commit()
+
+    profit     = market_usd - buy_price
+    pct        = ((market_usd - buy_price) / buy_price * 100) if buy_price > 0 else 0
+    emoji      = "📈" if profit >= 0 else "📉"
+    profit_str = f"\\+\\${profit:.2f}" if profit >= 0 else f"\\-\\${abs(profit):.2f}"
+
+    await update.message.reply_text(
+        f"✅ *Harga beli disimpan\\!*\n\n"
+        f"🃏 *{esc(card_name)}* \\({esc(card_set or '-')}\\)\n"
+        f"💸 Harga Beli : \\${buy_price:.2f}\n"
+        f"💵 Market    : \\${market_usd:.2f}\n"
+        f"{emoji} Profit    : {profit_str} \\({esc(f'{pct:.1f}')}%\\)",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /roi — Ringkasan ROI seluruh inventory ────────────────────────────────────
+async def show_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, price_idr, buy_price_usd, condition "
+            "FROM inventory WHERE user_id=? ORDER BY (price_usd - buy_price_usd) DESC",
+            (user_id,),
+        ) as cur:
+            items = await cur.fetchall()
+
+    if not items:
+        await update.message.reply_text("📂 Inventory kosong\\.", parse_mode="MarkdownV2")
+        return
+
+    tagged   = [(r) for r in items if r[4] > 0]
+    untagged = [(r) for r in items if r[4] <= 0]
+
+    if not tagged:
+        await update.message.reply_text(
+            "ℹ️ Belum ada kartu dengan harga beli\\.\n"
+            "Set dulu dengan `/buyprice \\<id\\> \\<harga\\>`\\.",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    total_buy    = sum(r[4] for r in tagged)
+    total_market = sum(r[2] for r in tagged)
+    total_profit = total_market - total_buy
+    total_pct    = (total_profit / total_buy * 100) if total_buy > 0 else 0
+    emoji_total  = "📈" if total_profit >= 0 else "📉"
+
+    lines = [f"💼 *ROI Portfolio \\({len(tagged)} kartu\\)*\n"]
+
+    for name, card_set, p_usd, p_idr, buy_usd, condition in tagged[:15]:
+        mult        = CONDITION_MULTIPLIERS.get(condition or "Near Mint", 1.0)
+        adj_market  = p_usd * mult
+        profit      = adj_market - buy_usd
+        pct         = (profit / buy_usd * 100) if buy_usd > 0 else 0
+        em          = "📈" if profit >= 0 else "📉"
+        p_str       = f"\\+{profit:.2f}" if profit >= 0 else f"\\-{abs(profit):.2f}"
+        lines.append(
+            f"{em} *{esc(name[:25])}*\n"
+            f"   Beli \\${buy_usd:.2f} → Market \\${adj_market:.2f} \\| {esc(f'{pct:.1f}')}%  \\(\\${p_str}\\)\n"
+        )
+
+    if len(tagged) > 15:
+        lines.append(f"_\\.\\.\\. dan {len(tagged)-15} kartu lainnya_\n")
+
+    lines.append(
+        f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+        f"{emoji_total} *Total Modal  : \\${total_buy:.2f}*\n"
+        f"{emoji_total} *Nilai Pasar  : \\${total_market:.2f}*\n"
+        f"{emoji_total} *Profit/Loss  : \\${total_profit:+.2f} \\({total_pct:+.1f}%\\)*"
+    )
+    if untagged:
+        lines.append(f"\n_\\({len(untagged)} kartu belum ada harga beli — pakai /buyprice\\)_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /trend <nama kartu> — Grafik tren harga ───────────────────────────────────
+async def price_trend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/trend \\<nama kartu\\>`\nContoh: `/trend Charizard`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    user_id   = update.effective_user.id
+    card_query = " ".join(context.args).strip()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, price_usd, recorded_at FROM price_history "
+            "WHERE user_id=? AND LOWER(card_name) LIKE LOWER(?) "
+            "ORDER BY recorded_at ASC LIMIT 60",
+            (user_id, f"%{card_query}%"),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            f"📭 Tidak ada data harga untuk *{esc(card_query)}*\\.\n"
+            "_Data dicatat setiap kali kamu /refresh inventory\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    if len(rows) < 2:
+        await update.message.reply_text(
+            f"📊 Baru *1 data poin* untuk *{esc(card_query)}*\\.\n"
+            "_Butuh minimal 2 data untuk menampilkan tren\\. Lakukan /refresh beberapa kali\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    if not HAS_MATPLOTLIB:
+        lines = [f"📈 *Tren Harga: {esc(rows[0][0])}*\n"]
+        for name, price, ts in rows:
+            lines.append(f"• {esc(ts[:10])} — \\${price:.2f}")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        return
+
+    card_name_display = rows[0][0]
+    dates  = [r[2][:10] for r in rows]
+    prices = [r[1] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(dates, prices, marker="o", linewidth=2, color="#E3350D", markersize=5)
+    ax.fill_between(range(len(dates)), prices, alpha=0.15, color="#E3350D")
+    ax.set_title(f"Tren Harga: {card_name_display}", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Harga (USD)")
+    ax.set_xlabel("Tanggal")
+    step = max(1, len(dates) // 6)
+    ax.set_xticks(range(0, len(dates), step))
+    ax.set_xticklabels(dates[::step], rotation=30, ha="right", fontsize=8)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:.2f}"))
+    ax.grid(True, alpha=0.3)
+
+    # Anotasi min/max
+    min_i = prices.index(min(prices))
+    max_i = prices.index(max(prices))
+    ax.annotate(f"Low\n${prices[min_i]:.2f}", xy=(min_i, prices[min_i]),
+                xytext=(0, -30), textcoords="offset points",
+                ha="center", fontsize=8, color="blue",
+                arrowprops=dict(arrowstyle="->", color="blue"))
+    ax.annotate(f"High\n${prices[max_i]:.2f}", xy=(max_i, prices[max_i]),
+                xytext=(0, 15), textcoords="offset points",
+                ha="center", fontsize=8, color="green",
+                arrowprops=dict(arrowstyle="->", color="green"))
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=130)
+    buf.seek(0)
+    plt.close(fig)
+
+    delta     = prices[-1] - prices[0]
+    delta_pct = (delta / prices[0] * 100) if prices[0] > 0 else 0
+    trend_em  = "📈" if delta >= 0 else "📉"
+    caption   = (
+        f"{trend_em} {card_name_display}\n"
+        f"Perubahan: ${delta:+.2f} ({delta_pct:+.1f}%) dari {len(rows)} data poin"
+    )
+    await update.message.reply_photo(photo=buf, caption=caption)
+
+
+# ── /setkomplit <nama set> — Set completion tracker ───────────────────────────
+async def set_completion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/setkomplit \\<nama set\\>`\nContoh: `/setkomplit Base Set`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    user_id  = update.effective_user.id
+    set_query = " ".join(context.args).strip()
+
+    await update.message.reply_text(
+        f"🔍 Mengambil data set *{esc(set_query)}* dari TCG API\\.\\.\\.",
+        parse_mode="MarkdownV2",
+    )
+
+    set_data = await search_pokemon_set(set_query, limit=200)
+
+    if not set_data or set_data.get("error") or not set_data.get("cards"):
+        await update.message.reply_text(
+            f"❌ Set *{esc(set_query)}* tidak ditemukan\\.",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    set_name   = set_data.get("set_name", set_query)
+    all_cards  = set_data["cards"]   # list of {name, ...}
+    total_in_set = len(all_cards)
+
+    # Ambil semua kartu user dari set ini
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT LOWER(card_name) FROM inventory WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            owned_raw = await cur.fetchall()
+
+    owned_names = {r[0] for r in owned_raw}
+
+    have     = []
+    missing  = []
+    for c in all_cards:
+        cname = c.get("name", "")
+        if cname.lower() in owned_names:
+            have.append(c)
+        else:
+            missing.append(c)
+
+    pct      = (len(have) / total_in_set * 100) if total_in_set > 0 else 0
+    bar_fill = int(pct / 10)
+    bar      = "█" * bar_fill + "░" * (10 - bar_fill)
+
+    # Estimasi biaya untuk kartu yang belum dimiliki
+    missing_cost = sum(c.get("price_usd", 0) for c in missing if c.get("price_usd", 0) > 0)
+    missing_idr  = missing_cost * EXCHANGE_RATE
+
+    lines = [
+        f"🏆 *{esc(set_name)}*\n",
+        f"📊 Kelengkapan: *{esc(f'{pct:.1f}')}%* \\[{esc(bar)}\\]\n",
+        f"✅ Dimiliki   : *{len(have)}/{total_in_set}* kartu\n",
+        f"❌ Belum punya: *{len(missing)}* kartu\n",
+    ]
+
+    if missing_cost > 0:
+        lines.append(
+            f"💸 Estimasi beli semua yang kurang:\n"
+            f"   \\${missing_cost:.2f} \\| Rp {missing_idr:,.0f}\n"
+        )
+
+    if missing:
+        lines.append(f"\n❌ *Belum punya \\({min(len(missing), 15)} ditampilkan\\):*")
+        for c in missing[:15]:
+            p = c.get("price_usd", 0)
+            p_str = f" — \\${p:.2f}" if p > 0 else ""
+            lines.append(f"• {esc(c.get('name','?'))}{p_str}")
+        if len(missing) > 15:
+            lines.append(f"_\\.\\.\\. dan {len(missing)-15} kartu lagi_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /jual <id> <harga_usd> — Catat penjualan kartu ───────────────────────────
+async def jual_kartu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Format: `/jual \\<id\\> \\<harga\\_jual\\_usd\\>`\n"
+            "Contoh: `/jual 3 25\\.00`\n"
+            "_Lihat ID di /inventory — kartu akan DIHAPUS dari inventory_",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    try:
+        card_id    = int(context.args[0])
+        sell_price = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID dan harga harus berupa angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, price_idr, buy_price_usd "
+            "FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await update.message.reply_text("❌ Kartu tidak ditemukan di inventory kamu\\.", parse_mode="MarkdownV2")
+            return
+
+        card_name, card_set, market_usd, market_idr, buy_price = row
+        sell_idr = sell_price * EXCHANGE_RATE
+        profit   = sell_price - (buy_price or 0.0)
+
+        # Simpan ke trade_log
+        await db.execute(
+            "INSERT INTO trade_log (user_id, card_name, card_set, sell_price_usd, sell_price_idr, buy_price_usd, profit_usd) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (user_id, card_name, card_set or "", sell_price, sell_idr, buy_price or 0.0, profit),
+        )
+        # Hapus dari inventory
+        await db.execute("DELETE FROM inventory WHERE id=? AND user_id=?", (card_id, user_id))
+        await db.commit()
+
+    em     = "📈" if profit >= 0 else "📉"
+    p_str  = f"\\+\\${profit:.2f}" if profit >= 0 else f"\\-\\${abs(profit):.2f}"
+    buy_str = f"\\${buy_price:.2f}" if buy_price and buy_price > 0 else "N/A"
+
+    await update.message.reply_text(
+        f"💰 *Kartu Terjual\\!*\n\n"
+        f"🃏 *{esc(card_name)}* \\({esc(card_set or '-')}\\)\n"
+        f"💸 Harga Beli : {buy_str}\n"
+        f"💵 Harga Jual : \\${sell_price:.2f} \\| Rp {sell_idr:,.0f}\n"
+        f"{em} Profit      : {p_str}\n\n"
+        f"_Kartu dihapus dari inventory\\. Lihat riwayat di /riwayatjual_",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /riwayatjual — Riwayat semua transaksi jual ───────────────────────────────
+async def riwayat_jual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, sell_price_usd, sell_price_idr, buy_price_usd, profit_usd, sold_at "
+            "FROM trade_log WHERE user_id=? ORDER BY sold_at DESC LIMIT 30",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "📭 Belum ada riwayat penjualan\\.\nJual kartu dengan `/jual \\<id\\> \\<harga\\>`\\.",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    total_profit  = sum(r[5] for r in rows)
+    total_revenue = sum(r[2] for r in rows)
+    em_total      = "📈" if total_profit >= 0 else "📉"
+
+    lines = [f"📋 *Riwayat Penjualan \\({len(rows)} transaksi\\)*\n"]
+
+    for name, card_set, sell_usd, sell_idr, buy_usd, profit, sold_at in rows:
+        em    = "📈" if profit >= 0 else "📉"
+        p_str = f"\\+\\${profit:.2f}" if profit >= 0 else f"\\-\\${abs(profit):.2f}"
+        date  = esc(sold_at[:10]) if sold_at else "\\-"
+        buy_s = f"\\${buy_usd:.2f}" if buy_usd and buy_usd > 0 else "N/A"
+        lines.append(
+            f"{em} *{esc(name[:22])}*\n"
+            f"   📅 {date} \\| Beli {buy_s} → Jual \\${sell_usd:.2f} \\| {p_str}\n"
+        )
+
+    lines.append(
+        f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+        f"{em_total} *Total Revenue : \\${total_revenue:.2f}*\n"
+        f"{em_total} *Total Profit  : \\${total_profit:+.2f}*"
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /wish override — tambah target_price ──────────────────────────────────────
+# Ganti fungsi add_wishlist yang lama supaya support target harga opsional
+# Format baru: /wish Charizard [target_usd]
+async def add_wishlist_v3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/wish \\<nama\\>` atau `/wish \\<nama\\> \\<target\\_usd\\>`\n"
+            "Contoh: `/wish Charizard 20`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    user_id      = update.effective_user.id
+    target_price = 0.0
+
+    # Cek apakah arg terakhir adalah angka (target harga)
+    args = list(context.args)
+    try:
+        target_price = float(args[-1])
+        card_query   = " ".join(args[:-1]).strip()
+        if not card_query:
+            raise ValueError
+    except ValueError:
+        card_query   = " ".join(args).strip()
+        target_price = 0.0
+
+    await update.message.reply_text(
+        f"🌟 Menambahkan *{esc(card_query)}* ke wishlist\\.\\.\\.",
+        parse_mode="MarkdownV2",
+    )
+
+    card = await search_pokemon_card(card_query)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if not card or (isinstance(card, dict) and card.get("error")):
+            await db.execute(
+                "INSERT INTO wishlist (user_id, card_name, card_set, price_usd, price_idr, target_price_usd) VALUES (?,?,?,?,?,?)",
+                (user_id, card_query, "Unknown", 0.0, 0.0, target_price),
+            )
+            await db.commit()
+            target_str = f" \\| 🎯 Target: \\${target_price:.2f}" if target_price > 0 else ""
+            await update.message.reply_text(
+                f"⭐ *{esc(card_query)}* ditambahkan ke wishlist{target_str} \\(harga belum tersedia\\)\\.",
+                parse_mode="MarkdownV2",
+            )
+            return
+
+        await db.execute(
+            "INSERT INTO wishlist (user_id, card_name, card_set, price_usd, price_idr, target_price_usd) VALUES (?,?,?,?,?,?)",
+            (user_id, card["name"], card["set"], card["price_usd"], card["price_idr"], target_price),
+        )
+        await db.commit()
+
+    price_str  = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+    idr_str    = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "N/A"
+    target_str = f"\n🎯 Target alert: \\${target_price:.2f}" if target_price > 0 else ""
+
+    # Cek apakah harga sudah di bawah target
+    hint = ""
+    if target_price > 0 and card["price_usd"] > 0 and card["price_usd"] <= target_price:
+        hint = "\n🔔 *Harga sekarang sudah di bawah target\\!*"
+
+    await update.message.reply_text(
+        f"⭐ *{esc(card['name'])}* masuk wishlist\\!\n"
+        f"📦 {esc(card['set'])} \\| 💵 {price_str} \\| {idr_str}"
+        f"{target_str}{hint}",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── Background job: cek target harga wishlist ─────────────────────────────────
+async def check_wishlist_targets(context) -> None:
+    """Dijalankan bersamaan dengan price_alert_checker. Cek wishlist target."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT DISTINCT user_id FROM wishlist WHERE target_price_usd > 0"
+        ) as cur:
+            users = [r[0] for r in await cur.fetchall()]
+
+    for user_id in users:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT id, card_name, price_usd, target_price_usd "
+                "FROM wishlist WHERE user_id=? AND target_price_usd > 0",
+                (user_id,),
+            ) as cur:
+                items = await cur.fetchall()
+
+        for wid, card_name, current_usd, target_usd in items:
+            if current_usd <= 0:
+                continue
+            if current_usd <= target_usd:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"🔔 *Wishlist Alert\\!*\n\n"
+                            f"⭐ *{esc(card_name)}*\n"
+                            f"Harga sekarang \\${current_usd:.2f} sudah ≤ target \\${target_usd:.2f}\\!\n"
+                            f"_Saatnya beli\\!_ 🛒"
+                        ),
+                        parse_mode="MarkdownV2",
+                    )
+                except Exception as e:
+                    logger.warning(f"Wishlist target notif gagal untuk user {user_id}: {e}")
+
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 async def post_init(application) -> None:
     await init_db()
@@ -1907,7 +2428,13 @@ async def post_init(application) -> None:
         first=60,
         name="price_alert_checker",
     )
-    logger.info("Price alert checker dijadwalkan setiap 6 jam.")
+    application.job_queue.run_repeating(
+        check_wishlist_targets,
+        interval=6 * 3600,
+        first=120,
+        name="wishlist_target_checker",
+    )
+    logger.info("Price alert + wishlist target checker dijadwalkan setiap 6 jam.")
 
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
@@ -1921,7 +2448,7 @@ def main() -> None:
     app.add_handler(CommandHandler("delete",        delete_inventory))
     app.add_handler(CommandHandler("setcondition",  set_condition))
     app.add_handler(CommandHandler("setgrade",      set_grade))
-    app.add_handler(CommandHandler("wish",          add_wishlist))
+    app.add_handler(CommandHandler("wish",          add_wishlist_v3))
     app.add_handler(CommandHandler("wishlist",      show_wishlist))
     app.add_handler(CommandHandler("removewish",    remove_wishlist))
     app.add_handler(CommandHandler("stats",         show_stats))
@@ -1940,12 +2467,19 @@ def main() -> None:
     app.add_handler(CommandHandler("nilai",         nilai_kondisi))
     app.add_handler(CommandHandler("lang",          set_language))
     app.add_handler(CommandHandler("backup",        backup_db))
+    # Commands baru v3
+    app.add_handler(CommandHandler("buyprice",      set_buyprice))
+    app.add_handler(CommandHandler("roi",           show_roi))
+    app.add_handler(CommandHandler("trend",         price_trend_cmd))
+    app.add_handler(CommandHandler("setkomplit",    set_completion))
+    app.add_handler(CommandHandler("jual",          jual_kartu))
+    app.add_handler(CommandHandler("riwayatjual",   riwayat_jual))
 
     app.add_handler(CallbackQueryHandler(handle_card_select, pattern=r"^card_select:"))
     app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo_search))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_card_search))
 
-    logger.info("Bot Pokémon Vision & Portfolio v2 aktif!")
+    logger.info("Bot Pokémon Vision & Portfolio v3 aktif! (buyprice, roi, trend, setkomplit, jual)")
     app.run_polling()
 
 if __name__ == "__main__":
