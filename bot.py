@@ -217,6 +217,16 @@ async def init_db() -> None:
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ustate_user ON user_states(user_id)")
 
+        # ── Daily report opt-in columns ──────────────────────────────────────
+        for col, definition in [
+            ("daily_enabled", "INTEGER DEFAULT 0"),
+            ("daily_chat_id", "INTEGER DEFAULT NULL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE user_settings ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
+
         # ── Reminders (fitur /remind) ─────────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
@@ -5216,6 +5226,618 @@ async def comparebulan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# v9 — FITUR LOKAL (tanpa API harga)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 1. /winnerloser — kartu yang paling naik & turun dari price_history ───────
+async def winnerloser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT card_name, price_usd, recorded_at
+            FROM price_history
+            WHERE user_id=?
+            ORDER BY card_name, recorded_at ASC
+        """, (uid,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "📊 Belum ada data history harga\\.\n"
+            "_Tambah harga via /editprice atau /updateharga terlebih dulu\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # Kumpulkan harga pertama & terakhir per nama kartu
+    card_data: dict = {}
+    for name, price, rec_at in rows:
+        if name not in card_data:
+            card_data[name] = {"first": price, "last": price}
+        else:
+            card_data[name]["last"] = price
+
+    # Hitung delta
+    deltas = []
+    for name, d in card_data.items():
+        delta = d["last"] - d["first"]
+        pct   = (delta / d["first"] * 100) if d["first"] > 0 else 0.0
+        deltas.append((name, d["first"], d["last"], delta, pct))
+
+    if len(deltas) < 2:
+        await update.message.reply_text(
+            "📊 Minimal 2 kartu dengan data history untuk menampilkan winner/loser\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    winners = sorted(deltas, key=lambda x: x[3], reverse=True)[:3]
+    losers  = sorted(deltas, key=lambda x: x[3])[:3]
+
+    lines = ["🏆 *WINNER \\& LOSER KARTU*\n"]
+
+    lines.append("📈 *Top Naik \\(Winners\\)*")
+    for i, (name, fp, lp, delta, pct) in enumerate(winners, 1):
+        sign = "\\+" if delta >= 0 else ""
+        lines.append(
+            f"{i}\\. *{esc(name)}*\n"
+            f"   {esc_usd(fp)} → {esc_usd(lp)}"
+            f"  \\(*{sign}{esc(f'{delta:.2f}')} USD / {sign}{esc(f'{pct:.1f}')}%*\\)"
+        )
+
+    lines.append("\n📉 *Top Turun \\(Losers\\)*")
+    for i, (name, fp, lp, delta, pct) in enumerate(losers, 1):
+        sign = "\\+" if delta >= 0 else ""
+        lines.append(
+            f"{i}\\. *{esc(name)}*\n"
+            f"   {esc_usd(fp)} → {esc_usd(lp)}"
+            f"  \\(*{sign}{esc(f'{delta:.2f}')} USD / {sign}{esc(f'{pct:.1f}')}%*\\)"
+        )
+
+    lines.append(f"\n_Data dari {len(deltas)} kartu di price history\\._")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── 2. /setcomplete <set> — progress checklist kelengkapan set ────────────────
+async def setcomplete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Gunakan: `/setcomplete <nama set>`\n"
+            "Contoh: `/setcomplete Base Set`\n\n"
+            "_Data kartu diambil dari cache lokal \\(/synccards untuk update\\)\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    set_name = " ".join(args)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT name FROM card_cache
+            WHERE LOWER(card_set) LIKE LOWER(?)
+            ORDER BY name
+        """, (f"%{set_name}%",)) as cur:
+            cache_rows = await cur.fetchall()
+
+        async with db.execute("""
+            SELECT LOWER(card_name) FROM inventory
+            WHERE user_id=? AND LOWER(card_set) LIKE LOWER(?)
+        """, (uid, f"%{set_name}%")) as cur:
+            inv_rows = await cur.fetchall()
+
+    if not cache_rows:
+        await update.message.reply_text(
+            f"⚠️ Set `{esc(set_name)}` tidak ditemukan di database lokal\\.\n"
+            "_Coba `/synccards` untuk mengisi data kartu dari API\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    cache_names  = [r[0] for r in cache_rows]
+    owned_lower  = {r[0] for r in inv_rows}
+    total        = len(cache_names)
+    owned_count  = sum(1 for n in cache_names if n.lower() in owned_lower)
+    pct          = (owned_count / total * 100) if total > 0 else 0.0
+    missing      = [n for n in cache_names if n.lower() not in owned_lower]
+
+    filled = int(pct / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
+
+    lines = [
+        f"📦 *Set: {esc(set_name)}*\n",
+        f"✅ Punya: *{owned_count}/{total}* kartu \\({esc(f'{pct:.1f}')}%\\)",
+        f"`{bar}`",
+    ]
+
+    if not missing:
+        lines.append("\n🎉 *SET KOMPLIT\\!* Kamu punya semua kartu di set ini\\! 🎊")
+    else:
+        lines.append(f"\n❌ *Belum punya \\({len(missing)} kartu\\):*")
+        for m in missing[:25]:
+            lines.append(f"  • {esc(m)}")
+        if len(missing) > 25:
+            lines.append(f"  _\\.\\.\\. dan {len(missing) - 25} kartu lagi_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── 3. /graderekomendasi — kartu yang layak di-PSA ───────────────────────────
+async def graderekomendasi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid       = update.effective_user.id
+    THRESHOLD = 10.0  # USD minimum untuk layak di-grade
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT id, card_name, card_set, condition, price_usd, price_idr, psa_grade
+            FROM inventory
+            WHERE user_id=?
+              AND psa_grade IS NULL
+              AND (LOWER(condition) LIKE '%near mint%' OR LOWER(condition) LIKE '%mint%')
+              AND price_usd >= ?
+            ORDER BY price_usd DESC
+        """, (uid, THRESHOLD)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            f"🔍 Tidak ada kartu yang memenuhi kriteria rekomendasi grading\\.\n\n"
+            f"_Kriteria:_\n"
+            f"  • Kondisi Near Mint atau Mint\n"
+            f"  • Nilai ≥ {esc_usd(THRESHOLD)}\n"
+            f"  • Belum memiliki PSA grade",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    lines = [
+        "🎓 *REKOMENDASI PSA GRADING*\n",
+        f"_Kartu kondisi NM/Mint, nilai ≥ {esc_usd(THRESHOLD)}, belum di\\-grade:_\n",
+    ]
+
+    for inv_id, name, card_set, cond, price_usd, price_idr, _ in rows:
+        set_str      = f" \\({esc(card_set)}\\)" if card_set else ""
+        potential    = price_usd * 3.0
+        lines.append(
+            f"• *{esc(name)}*{set_str} `\\#{inv_id}`\n"
+            f"  {esc(cond)} \\| {esc_usd(price_usd)} \\| Rp {price_idr:,.0f}\n"
+            f"  💡 _Potensi PSA 10: \\~{esc_usd(potential)}_"
+        )
+
+    lines.append(
+        f"\n_Biaya grading \\~\\$20\\-50/kartu via PSA\\. "
+        f"Kartu PSA 10 bisa bernilai 2\\-5× lipat\\._"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── 4. /tradein <id1> <id2> — simulasi tukar kartu ───────────────────────────
+async def tradein_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Gunakan: `/tradein <id1> <id2>`\n"
+            "Simulasi tukar kartu \\#id1 dengan \\#id2\\.\n"
+            "_Gunakan /inventory untuk melihat ID kartu\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    try:
+        id1 = int(args[0].lstrip('#'))
+        id2 = int(args[1].lstrip('#'))
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus berupa angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade "
+            "FROM inventory WHERE id=? AND user_id=?",
+            (id1, uid)
+        ) as cur:
+            card1 = await cur.fetchone()
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade "
+            "FROM inventory WHERE id=? AND user_id=?",
+            (id2, uid)
+        ) as cur:
+            card2 = await cur.fetchone()
+
+    if not card1:
+        await update.message.reply_text(f"⚠️ Kartu \\#{esc(str(id1))} tidak ditemukan\\.", parse_mode="MarkdownV2")
+        return
+    if not card2:
+        await update.message.reply_text(f"⚠️ Kartu \\#{esc(str(id2))} tidak ditemukan\\.", parse_mode="MarkdownV2")
+        return
+
+    _, n1, s1, p1, pi1, c1, g1 = card1
+    _, n2, s2, p2, pi2, c2, g2 = card2
+
+    delta_usd = p1 - p2
+    delta_idr = pi1 - pi2
+
+    if delta_usd > 0.005:
+        verdict_emoji = "✅"
+        verdict_text  = (
+            f"Kamu *untung* {esc_usd(abs(delta_usd))} "
+            f"\\(Rp {abs(delta_idr):,.0f}\\) dengan menukar \\#{id1} → \\#{id2}"
+        )
+    elif delta_usd < -0.005:
+        verdict_emoji = "⚠️"
+        verdict_text  = (
+            f"Kamu *rugi* {esc_usd(abs(delta_usd))} "
+            f"\\(Rp {abs(delta_idr):,.0f}\\) dengan menukar \\#{id1} → \\#{id2}"
+        )
+    else:
+        verdict_emoji = "⚖️"
+        verdict_text  = "Nilai *setara*\\! Trade ini impas\\."
+
+    s1_str  = f" \\({esc(s1)}\\)" if s1 else ""
+    s2_str  = f" \\({esc(s2)}\\)" if s2 else ""
+    g1_str  = f" \\| PSA {esc(str(g1))}" if g1 else ""
+    g2_str  = f" \\| PSA {esc(str(g2))}" if g2 else ""
+
+    msg = (
+        f"🔄 *SIMULASI TRADE\\-IN*\n\n"
+        f"*Kartu yang kamu berikan:*\n"
+        f"  `\\#{id1}` *{esc(n1)}*{s1_str}\n"
+        f"  {esc(c1)}{g1_str} \\| {esc_usd(p1)} \\| Rp {pi1:,.0f}\n\n"
+        f"*Kartu yang kamu terima:*\n"
+        f"  `\\#{id2}` *{esc(n2)}*{s2_str}\n"
+        f"  {esc(c2)}{g2_str} \\| {esc_usd(p2)} \\| Rp {pi2:,.0f}\n\n"
+        f"{verdict_emoji} {verdict_text}"
+    )
+    await update.message.reply_text(msg, parse_mode="MarkdownV2")
+
+
+# ── 5. /daily on|off — toggle laporan harian ──────────────────────────────────
+async def toggle_daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid     = update.effective_user.id
+    chat_id = update.effective_chat.id
+    args    = context.args
+
+    if not args or args[0].lower() not in ("on", "off"):
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT daily_enabled FROM user_settings WHERE user_id=?", (uid,)
+            ) as cur:
+                row = await cur.fetchone()
+        enabled = (row[0] if row else 0)
+        status  = "✅ *ON*" if enabled else "❌ *OFF*"
+        await update.message.reply_text(
+            f"📅 *Laporan Harian*\n\nStatus saat ini: {status}\n\n"
+            f"Aktifkan dengan `/daily on`\n"
+            f"Nonaktifkan dengan `/daily off`\n\n"
+            f"_Laporan dikirim setiap hari pukul 08:00\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    turn_on = args[0].lower() == "on"
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO user_settings (user_id, daily_enabled, daily_chat_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                daily_enabled = excluded.daily_enabled,
+                daily_chat_id = excluded.daily_chat_id
+        """, (uid, 1 if turn_on else 0, chat_id if turn_on else None))
+        await db.commit()
+
+    if turn_on:
+        await update.message.reply_text(
+            "✅ *Laporan Harian* diaktifkan\\!\n"
+            "_Kamu akan menerima ringkasan portofolio setiap pagi pukul 08:00\\._",
+            parse_mode="MarkdownV2"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ *Laporan Harian* dinonaktifkan\\.",
+            parse_mode="MarkdownV2"
+        )
+
+
+async def send_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job — kirim laporan harian ke semua user opt-in."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, daily_chat_id FROM user_settings "
+            "WHERE daily_enabled=1 AND daily_chat_id IS NOT NULL"
+        ) as cur:
+            users = await cur.fetchall()
+
+    for user_id, chat_id in users:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT SUM(price_usd), SUM(price_idr), COUNT(*) FROM inventory WHERE user_id=?",
+                    (user_id,)
+                ) as cur:
+                    prow = await cur.fetchone()
+
+                yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+                async with db.execute("""
+                    SELECT total_usd FROM portfolio_snapshots
+                    WHERE user_id=? AND snapped_at LIKE ?
+                    ORDER BY snapped_at DESC LIMIT 1
+                """, (user_id, f"{yesterday}%")) as cur:
+                    yrow = await cur.fetchone()
+
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                async with db.execute("""
+                    SELECT card_name FROM reminders
+                    WHERE user_id=? AND sent=0 AND remind_at LIKE ?
+                    LIMIT 5
+                """, (user_id, f"{today_str}%")) as cur:
+                    rems = await cur.fetchall()
+
+                async with db.execute(
+                    "SELECT COUNT(*) FROM wishlist WHERE user_id=?", (user_id,)
+                ) as cur:
+                    wrow = await cur.fetchone()
+
+            total_usd  = prow[0] or 0.0
+            total_idr  = prow[1] or 0.0
+            card_count = prow[2] or 0
+
+            delta_str = ""
+            if yrow and yrow[0]:
+                delta = total_usd - yrow[0]
+                sign  = "\\+" if delta >= 0 else ""
+                emoji_d = "📈" if delta >= 0 else "📉"
+                delta_str = f"\n   {emoji_d} Δ kemarin: *{sign}{esc(f'{delta:.2f}')} USD*"
+
+            tanggal = datetime.now().strftime("%d %B %Y")
+            lines = [
+                f"🌅 *Laporan Harian PokéDex*",
+                f"_{esc(tanggal)}_\n",
+                f"💼 *Portofolio*",
+                f"   {card_count} kartu \\| {esc_usd(total_usd)}{delta_str}",
+                f"   Rp {total_idr:,.0f}",
+            ]
+
+            if rems:
+                lines.append(f"\n⏰ *Reminder Hari Ini:*")
+                for (cname,) in rems:
+                    lines.append(f"   • {esc(cname)}")
+
+            wish_count = wrow[0] if wrow else 0
+            if wish_count:
+                lines.append(f"\n📋 Wishlist: *{wish_count}* kartu")
+
+            lines.append(f"\n_/inventory \\| /stats \\| /roi \\| /winnerloser_")
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="\n".join(lines),
+                parse_mode="MarkdownV2"
+            )
+            logger.info(f"[daily_report] Sent to user {user_id}")
+        except Exception as e:
+            logger.error(f"[daily_report] Error user {user_id}: {e}")
+
+
+# ── 6. /qr <id> — QR code kartu ──────────────────────────────────────────────
+async def qr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Gunakan: `/qr <id>`\nContoh: `/qr 5`\n"
+            "_Membuat QR code berisi info kartu dengan ID tersebut\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    try:
+        card_id = int(args[0].lstrip('#'))
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus berupa angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, tags "
+            "FROM inventory WHERE id=? AND user_id=?",
+            (card_id, uid)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text(
+            f"⚠️ Kartu \\#{esc(str(card_id))} tidak ditemukan\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    inv_id, name, card_set, price_usd, price_idr, cond, grade, tags = row
+
+    # Isi QR code
+    parts = [f"PokeDex:{name}"]
+    if card_set:  parts.append(f"Set:{card_set}")
+    parts.append(f"Price:${price_usd:.2f}")
+    parts.append(f"Cond:{cond}")
+    if grade:     parts.append(f"PSA:{grade}")
+    if tags:      parts.append(f"Tags:{tags}")
+    qr_data = " | ".join(parts)
+
+    def _make_qr_image() -> bytes:
+        QR_SIZE = 300
+        LABEL_H = 64
+        img_w   = QR_SIZE
+        img_h   = QR_SIZE
+
+        try:
+            import qrcode as qrmod
+            qr = qrmod.QRCode(version=1, box_size=9, border=3,
+                               error_correction=qrmod.constants.ERROR_CORRECT_M)
+            qr.add_data(qr_data)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            img_w  = qr_img.width
+            img_h  = qr_img.height
+        except ImportError:
+            # Fallback tanpa library qrcode
+            qr_img = Image.new("RGB", (QR_SIZE, QR_SIZE), "white")
+            d = ImageDraw.Draw(qr_img)
+            d.rectangle([20, 20, QR_SIZE - 20, QR_SIZE - 20], outline="black", width=3)
+            d.text((QR_SIZE // 2, QR_SIZE // 2 - 10), "QR CODE", fill="black", anchor="mm")
+            d.text((QR_SIZE // 2, QR_SIZE // 2 + 12), "(install qrcode)", fill="#888", anchor="mm")
+
+        # Canvas: QR + label strip di bawah
+        final = Image.new("RGB", (img_w, img_h + LABEL_H), "white")
+        final.paste(qr_img, (0, 0))
+        draw = ImageDraw.Draw(final)
+
+        try:
+            font_b  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 15)
+            font_sm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+        except Exception:
+            font_b = font_sm = ImageFont.load_default()
+
+        label_name  = name[:38] if len(name) > 38 else name
+        label_price = f"${price_usd:.2f}  |  {cond}"
+        cx = img_w // 2
+
+        draw.text((cx, img_h + 8),  label_name,  font=font_b,  fill="#111", anchor="mt")
+        draw.text((cx, img_h + 32), label_price, font=font_sm, fill="#555", anchor="mt")
+        draw.text((cx, img_h + 50), f"ID #{inv_id}", font=font_sm, fill="#aaa", anchor="mt")
+
+        buf = io.BytesIO()
+        final.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.read()
+
+    await update.message.reply_text("🔄 Membuat QR code\\.\\.\\.", parse_mode="MarkdownV2")
+    img_bytes = await asyncio.to_thread(_make_qr_image)
+
+    buf = io.BytesIO(img_bytes)
+    buf.name = f"qr_{card_id}.png"
+
+    set_str = f" ({card_set})" if card_set else ""
+    caption = (
+        f"🔳 QR Code: {name}{set_str}\n"
+        f"💵 ${price_usd:.2f}  |  {cond}"
+        + (f"\n🎓 PSA {grade}" if grade else "")
+    )
+    await update.message.reply_photo(photo=buf, caption=caption)
+
+
+# ── 7. /katalog — HTML katalog koleksi ───────────────────────────────────────
+async def katalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT id, card_name, card_set, price_usd, price_idr,
+                   condition, psa_grade, tags
+            FROM inventory
+            WHERE user_id=?
+            ORDER BY card_set, card_name
+        """, (uid,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "📚 Inventory kamu kosong\\. Tambah kartu dulu dengan /add\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    await update.message.reply_text("🔄 Membuat katalog HTML\\.\\.\\.", parse_mode="MarkdownV2")
+
+    def _build_html() -> str:
+        total_usd = sum(r[3] for r in rows)
+        total_idr = sum(r[4] for r in rows)
+        generated = datetime.now().strftime("%d %B %Y, %H:%M")
+
+        cards_html_parts = []
+        for inv_id, name, card_set, price_usd, price_idr, cond, grade, tags in rows:
+            grade_badge = (
+                f'<span class="badge psa">PSA {grade}</span>' if grade else ""
+            )
+            set_html  = f'<div class="card-set">{card_set or "—"}</div>'
+            tags_html = f'<div class="tags">🔖 {tags}</div>' if tags else ""
+            cards_html_parts.append(f"""
+        <div class="card-item">
+          <div class="card-header">
+            <span class="card-id">#{inv_id}</span>
+            {grade_badge}
+          </div>
+          <div class="card-name">{name}</div>
+          {set_html}
+          <div class="card-cond">{cond}</div>
+          <div class="card-price">
+            <span class="usd">${price_usd:.2f}</span>
+            <span class="idr">Rp {price_idr:,.0f}</span>
+          </div>
+          {tags_html}
+        </div>""")
+
+        cards_block = "\n".join(cards_html_parts)
+        return f"""<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PokéDex Price — Katalog Koleksi</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Segoe UI',Arial,sans-serif;background:#1a1a2e;color:#eee;padding:20px}}
+h1{{text-align:center;color:#f5c518;font-size:2em;margin-bottom:4px}}
+.subtitle{{text-align:center;color:#aaa;margin-bottom:20px;font-size:.9em}}
+.summary{{display:flex;gap:16px;justify-content:center;margin-bottom:28px;flex-wrap:wrap}}
+.summary-box{{background:#16213e;border-radius:12px;padding:14px 24px;text-align:center;border:1px solid #0f3460}}
+.summary-box .val{{font-size:1.4em;font-weight:bold;color:#f5c518}}
+.summary-box .lbl{{font-size:.8em;color:#aaa;margin-top:4px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}}
+.card-item{{background:#16213e;border-radius:12px;padding:16px;border:1px solid #0f3460;transition:transform .2s}}
+.card-item:hover{{transform:translateY(-2px);border-color:#f5c518}}
+.card-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}}
+.card-id{{color:#888;font-size:.8em}}
+.badge.psa{{background:#e63946;color:#fff;border-radius:4px;padding:2px 6px;font-size:.75em;font-weight:bold}}
+.card-name{{font-weight:bold;font-size:1.05em;color:#fff;margin-bottom:4px}}
+.card-set{{color:#aaa;font-size:.82em;margin-bottom:6px}}
+.card-cond{{color:#80c9ff;font-size:.82em;margin-bottom:8px}}
+.card-price .usd{{color:#f5c518;font-weight:bold;font-size:1.1em;display:block}}
+.card-price .idr{{color:#aaa;font-size:.8em}}
+.tags{{color:#a8d8a8;font-size:.78em;margin-top:8px}}
+footer{{text-align:center;color:#555;margin-top:32px;font-size:.8em}}
+</style>
+</head>
+<body>
+<h1>🃏 PokéDex Price</h1>
+<p class="subtitle">Katalog Koleksi — {generated}</p>
+<div class="summary">
+  <div class="summary-box"><div class="val">{len(rows)}</div><div class="lbl">Total Kartu</div></div>
+  <div class="summary-box"><div class="val">${total_usd:,.2f}</div><div class="lbl">Nilai USD</div></div>
+  <div class="summary-box"><div class="val">Rp {total_idr:,.0f}</div><div class="lbl">Nilai IDR</div></div>
+</div>
+<div class="grid">
+{cards_block}
+</div>
+<footer>Generated by PokéDex Price Bot · {generated}</footer>
+</body>
+</html>"""
+
+    html_content = await asyncio.to_thread(_build_html)
+    buf = io.BytesIO(html_content.encode("utf-8"))
+    buf.name = "katalog_koleksi.html"
+
+    await update.message.reply_document(
+        document=buf,
+        filename="katalog_koleksi.html",
+        caption=(
+            f"📚 Katalog koleksi kamu ({len(rows)} kartu)\n"
+            f"Buka file .html di browser untuk tampilan penuh! 🌐"
+        )
+    )
+
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
@@ -5321,12 +5943,23 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(restore_card_cb, pattern=r"^restore_card:"))
     app.add_handler(CallbackQueryHandler(purge_card_cb,   pattern=r"^purge_card:"))
 
+    # Commands baru v9 (lokal, tanpa API harga)
+    app.add_handler(CommandHandler("winnerloser",       winnerloser_cmd))
+    app.add_handler(CommandHandler("setcomplete",       setcomplete_cmd))
+    app.add_handler(CommandHandler("graderekomendasi",  graderekomendasi_cmd))
+    app.add_handler(CommandHandler("tradein",           tradein_cmd))
+    app.add_handler(CommandHandler("daily",             toggle_daily_cmd))
+    app.add_handler(CommandHandler("qr",                qr_cmd))
+    app.add_handler(CommandHandler("katalog",           katalog_cmd))
+
     # Background jobs
     jq = app.job_queue
     jq.run_repeating(auto_snapshot_all,  interval=86400, first=60)    # snapshot harian
     jq.run_repeating(check_reminders,    interval=3600,  first=120)   # cek reminder tiap jam
+    # Laporan harian pukul 08:00 (UTC+7 = 01:00 UTC)
+    jq.run_daily(send_daily_report, time=__import__("datetime").time(1, 0, 0))
 
-    logger.info("Bot Pokémon Vision & Portfolio v8 aktif! (+updateharga, prediksi, tag, multi-foto, remind, listing, exportpdf, comparebulan)")
+    logger.info("Bot Pokémon Vision & Portfolio v9 aktif! (+winnerloser, setcomplete, graderekomendasi, tradein, daily, qr, katalog)")
     app.run_polling()
 
 if __name__ == "__main__":
