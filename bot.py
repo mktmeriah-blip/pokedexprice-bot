@@ -12,7 +12,7 @@ import aiosqlite
 import httpx
 from dotenv import load_dotenv
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
@@ -1088,6 +1088,35 @@ async def handle_ocr_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── Handler foto ─────────────────────────────────────────────────────────────
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
+    # ── Intercept /setphoto flow ──────────────────────────────────────────────
+    setphoto_id = await pop_ustate(user_id, "pending_setphoto_id")
+    if setphoto_id is not None:
+        if not update.message.photo:
+            await update.message.reply_text("⚠️ Kirim foto bre, bukan file\\.", parse_mode="MarkdownV2")
+            await set_ustate(user_id, "pending_setphoto_id", setphoto_id)  # kembalikan state
+            return
+        file_id = update.message.photo[-1].file_id
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT card_name FROM inventory WHERE id=? AND user_id=?",
+                (setphoto_id, user_id),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    "UPDATE inventory SET photo_file_id=? WHERE id=? AND user_id=?",
+                    (file_id, setphoto_id, user_id),
+                )
+                await db.commit()
+                await update.message.reply_photo(
+                    photo=file_id,
+                    caption=f"✅ Foto *{esc(row[0])}* \\(ID: \\#{setphoto_id}\\) berhasil diupdate\\!\n_Lihat dengan /photo {setphoto_id}_",
+                    parse_mode="MarkdownV2",
+                )
+            else:
+                await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return  # jangan lanjut ke OCR flow
 
     # Simpan file_id foto terbesar (kualitas terbaik) untuk disimpan ke inventory nanti
     if update.message.photo:
@@ -2571,6 +2600,48 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
     text    = update.message.text.strip()
 
+    # ── Cek pending_editkartu_nama (/editkartu → edit nama) ───────────────────
+    _ek_nama_id = await pop_ustate(user_id, "pending_editkartu_nama")
+    if _ek_nama_id is not None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE inventory SET card_name=? WHERE id=? AND user_id=?",
+                (text, _ek_nama_id, user_id),
+            )
+            await db.commit()
+        await update.message.reply_text(
+            f"✅ Nama kartu \\#{_ek_nama_id} diubah jadi: *{esc(text)}*",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    # ── Cek pending_editkartu_harga (/editkartu → edit harga) ─────────────────
+    _ek_harga_id = await get_ustate(user_id, "pending_editkartu_harga")
+    if _ek_harga_id is not None:
+        try:
+            price_idr = parse_rupiah(text)
+            if price_idr <= 0:
+                raise ValueError("harga nol")
+            price_usd = round(price_idr / EXCHANGE_RATE, 2)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE inventory SET price_usd=?, price_idr=? WHERE id=? AND user_id=?",
+                    (price_usd, price_idr, _ek_harga_id, user_id),
+                )
+                await db.commit()
+            await del_ustate(user_id, "pending_editkartu_harga")
+            await update.message.reply_text(
+                f"✅ Harga kartu \\#{_ek_harga_id} diubah jadi:\n"
+                f"💵 {esc_usd(price_usd)} \\| Rp {esc(f'{price_idr:,.0f}')}",
+                parse_mode="MarkdownV2",
+            )
+        except (ValueError, ZeroDivisionError):
+            await update.message.reply_text(
+                "⚠️ Masukkan angka Rupiah yang valid bre\\!\n_Contoh: `1500000`_",
+                parse_mode="MarkdownV2",
+            )
+        return
+
     # ── Cek pending_manual_edit_nama ──────────────────────────────────────────
     _edit_nama = await pop_ustate(user_id, "pending_manual_edit_nama")
     if _edit_nama is not None:
@@ -2958,34 +3029,60 @@ async def cari_lokal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    query = " ".join(context.args).strip()
+    query   = " ".join(context.args).strip()
+    user_id = update.effective_user.id
+
     async with aiosqlite.connect(DB_PATH) as db:
+        # Cari di inventory user dulu
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, photo_file_id "
+            "FROM inventory WHERE user_id=? AND LOWER(card_name) LIKE LOWER(?) ORDER BY id",
+            (user_id, f"%{query}%"),
+        ) as cur:
+            inv_rows = await cur.fetchall()
+        # Cari di card cache (market)
         async with db.execute(
             "SELECT name, card_set, set_series, price_usd FROM card_cache "
-            "WHERE LOWER(name) LIKE LOWER(?) ORDER BY price_usd DESC LIMIT 15",
+            "WHERE LOWER(name) LIKE LOWER(?) ORDER BY price_usd DESC LIMIT 10",
             (f"%{query}%",),
         ) as cur:
-            rows = await cur.fetchall()
+            cache_rows = await cur.fetchall()
 
-    if not rows:
+    if not inv_rows and not cache_rows:
         suggestions = await get_autocomplete_suggestions(query, limit=5)
         if suggestions:
-            lines = [f"🔍 *'{esc(query)}'* tidak ditemukan di cache\\.\n\n💡 *Mungkin maksudnya:*"]
+            lines = [f"🔍 *'{esc(query)}'* tidak ditemukan\\.\n\n💡 *Mungkin maksudnya:*"]
             for s in suggestions:
                 lines.append(f"• `{esc(s)}`")
             await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
         else:
             await update.message.reply_text(
-                f"📭 Tidak ada kartu '{esc(query)}' di cache lokal\\.\n_Jalankan /synccards untuk update\\._",
+                f"📭 Tidak ada kartu *'{esc(query)}'*\\.\n_Ketik nama langsung untuk cek harga real\\-time_",
                 parse_mode="MarkdownV2",
             )
         return
 
-    lines = [f"🔍 *Hasil Cache: '{esc(query)}' \\({len(rows)} kartu\\)*\n"]
-    for name, card_set, series, p_usd in rows:
-        p_str = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
-        lines.append(f"• *{esc(name)}* — {esc(card_set or '?')} \\| {esc(series or '?')} \\| {p_str}")
-    lines.append("\n_Ketik nama kartu langsung untuk cek harga real\\-time_")
+    lines = [f"🔍 *Hasil Cari: '{esc(query)}'*\n"]
+
+    if inv_rows:
+        lines.append(f"*📦 Inventory Kamu \\({len(inv_rows)} kartu\\):*")
+        for inv_id, name, card_set, p_usd, p_idr, condition, psa_grade, photo_file_id in inv_rows:
+            usd_str   = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
+            grade_str = f" \\| PSA {esc(psa_grade)}" if psa_grade else ""
+            photo_str = " 📷" if photo_file_id else ""
+            set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
+            lines.append(
+                f"  \\#{inv_id} *{esc(name)}*{set_str}{grade_str}{photo_str}\n"
+                f"  💵 {usd_str} \\| Rp {esc(f'{p_idr:,.0f}')} \\| {esc(condition or 'Near Mint')}"
+            )
+        lines.append("")
+
+    if cache_rows:
+        lines.append(f"*🌐 Market \\({len(cache_rows)} hasil\\):*")
+        for name, card_set, series, p_usd in cache_rows:
+            p_str = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
+            lines.append(f"  • *{esc(name)}* — {esc(card_set or '?')} \\| {p_str}")
+        lines.append("\n_Ketik nama kartu langsung untuk cek harga real\\-time_")
 
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
@@ -3886,6 +3983,370 @@ async def debug_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         await update.message.reply_text(f"❌ DB Error: `{str(e)}`", parse_mode="MarkdownV2")
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── FITUR BARU v7 ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── /setphoto <id> — Upload/update foto untuk kartu yang sudah ada ────────────
+async def set_card_photo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "📸 Format: `/setphoto \\<id\\>`\n_Contoh: `/setphoto 4`_\n\nID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+
+    await set_ustate(user_id, "pending_setphoto_id", card_id)
+    await update.message.reply_text(
+        f"📸 Siap update foto *{esc(row[0])}* \\(ID: \\#{card_id}\\)\\!\n\n"
+        f"Sekarang *kirim fotonya* bre 👇",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /editkartu <id> — Edit nama atau harga kartu ─────────────────────────────
+async def editkartu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/editkartu \\<id\\>`\n_Contoh: `/editkartu 4`_",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, price_usd, price_idr, condition FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, price_usd, price_idr, condition = row
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Edit Nama",  callback_data=f"editkartu_nama:{card_id}:{user_id}")],
+        [InlineKeyboardButton("💰 Edit Harga", callback_data=f"editkartu_harga:{card_id}:{user_id}")],
+        [InlineKeyboardButton("❌ Batal",       callback_data=f"editkartu_batal:{card_id}:{user_id}")],
+    ])
+    await update.message.reply_text(
+        f"✏️ *Edit Kartu \\#{card_id}*\n\n"
+        f"🃏 Nama: *{esc(card_name)}*\n"
+        f"💵 Harga: {esc_usd(price_usd)} \\| Rp {esc(f'{price_idr:,.0f}')}\n"
+        f"🏷️ Kondisi: {esc(condition or 'Near Mint')}\n\n"
+        f"Mau edit apa?",
+        parse_mode="MarkdownV2",
+        reply_markup=keyboard,
+    )
+
+
+async def editkartu_nama_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    parts   = query.data.split(":")
+    card_id = int(parts[1])
+    user_id = int(parts[2])
+    if update.effective_user.id != user_id:
+        return
+    await set_ustate(user_id, "pending_editkartu_nama", card_id)
+    await query.message.reply_text(
+        f"✏️ Ketik *nama baru* untuk kartu \\#{card_id}:",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def editkartu_harga_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    parts   = query.data.split(":")
+    card_id = int(parts[1])
+    user_id = int(parts[2])
+    if update.effective_user.id != user_id:
+        return
+    await set_ustate(user_id, "pending_editkartu_harga", card_id)
+    await query.message.reply_text(
+        f"💰 Ketik *harga baru* \\(Rupiah\\) untuk kartu \\#{card_id}:\n_Contoh: `1500000`_",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def editkartu_batal_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.message.edit_text("❌ Edit dibatalkan\\.", parse_mode="MarkdownV2")
+
+
+# ── /portfolio — Ringkasan portfolio lengkap ──────────────────────────────────
+async def show_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(price_usd),0), COALESCE(SUM(price_idr),0), COALESCE(SUM(buy_price_usd),0) "
+            "FROM inventory WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            count, total_market_usd, total_market_idr, total_buy_usd = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(profit_usd),0) FROM trade_log WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            sold_count, realized_profit = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) FROM inventory WHERE user_id=? AND photo_file_id IS NOT NULL",
+            (user_id,),
+        ) as cur:
+            (photo_count,) = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) FROM inventory WHERE user_id=? AND psa_grade IS NOT NULL",
+            (user_id,),
+        ) as cur:
+            (graded_count,) = await cur.fetchone()
+
+    unrealized = total_market_usd - total_buy_usd
+    roi_pct    = (unrealized / total_buy_usd * 100) if total_buy_usd > 0 else 0
+    em_u       = "📈" if unrealized >= 0 else "📉"
+    em_r       = "📈" if realized_profit >= 0 else "📉"
+
+    await update.message.reply_text(
+        f"💼 *Portfolio Summary*\n\n"
+        f"🃏 Total Kartu     : *{count}* kartu\n"
+        f"📷 Punya Foto      : *{photo_count}* kartu\n"
+        f"🏆 Sudah Graded    : *{graded_count}* kartu\n\n"
+        f"💰 Nilai Market    : *{esc_usd(total_market_usd)}*\n"
+        f"   \\(≈ Rp {esc(f'{total_market_idr:,.0f}')}\\)\n"
+        f"💸 Total Modal     : *{esc_usd(total_buy_usd)}*\n"
+        f"{em_u} Unrealized P/L : *{esc(f'{unrealized:+.2f}')}* \\({roi_pct:+.1f}%\\)\n\n"
+        f"📋 Sudah Terjual   : *{sold_count}* kartu\n"
+        f"{em_r} Realized Profit: *{esc(f'{realized_profit:+.2f}')}*\n\n"
+        f"_Detail: /roi \\| Riwayat: /riwayatjual \\| Grafik: /portfoliochart_",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /setalert <id> <persen> — Alert harga ±X% dari harga beli ────────────────
+async def setalert_persen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Format: `/setalert \\<id\\> \\<persen\\>`\n"
+            "_Contoh: `/setalert 4 20` → notif kalau harga naik/turun 20% dari harga beli_\n\n"
+            "ID kartu bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+        persen  = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID dan persen harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, buy_price_usd, price_usd FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, buy_price, market_price = row
+    if not buy_price or buy_price <= 0:
+        await update.message.reply_text(
+            f"⚠️ Kartu *{esc(card_name)}* belum ada harga beli\\.\n"
+            f"Set dulu dengan `/buyprice {card_id} \\<harga\\_usd\\>`",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    threshold_naik  = round(buy_price * (1 + persen / 100), 2)
+    threshold_turun = round(buy_price * (1 - persen / 100), 2)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO price_alerts (user_id, card_name, threshold_usd, alert_type) VALUES (?,?,?,?)",
+            (user_id, card_name, threshold_naik, "naik"),
+        )
+        if threshold_turun > 0:
+            await db.execute(
+                "INSERT INTO price_alerts (user_id, card_name, threshold_usd, alert_type) VALUES (?,?,?,?)",
+                (user_id, card_name, threshold_turun, "turun"),
+            )
+        await db.commit()
+
+    current_str = f"{esc_usd(market_price)}" if market_price and market_price > 0 else "N/A"
+    await update.message.reply_text(
+        f"🔔 *Alert ±{esc(str(persen))}% diset\\!*\n\n"
+        f"🃏 *{esc(card_name)}*\n"
+        f"💰 Harga Beli    : {esc_usd(buy_price)}\n"
+        f"📊 Harga Market  : {current_str}\n\n"
+        f"📈 Notif NAIK  ≥ {esc_usd(threshold_naik)} \\(\\+{esc(str(persen))}%\\)\n"
+        f"📉 Notif TURUN ≤ {esc_usd(threshold_turun)} \\(\\-{esc(str(persen))}%\\)\n\n"
+        f"_Bot cek harga setiap 6 jam\\. Lihat: /alerts_",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /share <id> — Generate gambar cantik kartu untuk di-share ────────────────
+def _generate_share_image(
+    name: str, card_set: str, price_usd: float, price_idr: float,
+    condition: str, psa_grade: str
+) -> bytes:
+    """Buat gambar kartu bergaya untuk di-share. Return bytes PNG."""
+    W, H = 800, 320
+    # Background gelap bergradasi
+    img  = Image.new("RGB", (W, H), (12, 12, 28))
+    draw = ImageDraw.Draw(img)
+
+    # Accent bar atas & bawah (gold)
+    GOLD = (255, 215, 0)
+    draw.rectangle([0, 0, W, 7], fill=GOLD)
+    draw.rectangle([0, H - 7, W, H], fill=GOLD)
+
+    # Helper font loader
+    def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+        font_paths = [
+            f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'\\-Bold' if bold else ''}.ttf",
+            f"/usr/share/fonts/truetype/liberation/LiberationSans{'-Bold' if bold else ''}.ttf",
+            "/system/fonts/Roboto-Regular.ttf",
+        ]
+        for fp in font_paths:
+            try:
+                return ImageFont.truetype(fp, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    f_big  = load_font(34, bold=True)
+    f_med  = load_font(22)
+    f_sm   = load_font(17)
+    f_tiny = load_font(14)
+
+    # Card name (potong kalau > 38 char)
+    display_name = (name[:36] + "…") if len(name) > 38 else name
+    draw.text((30, 25), display_name, fill=(255, 255, 255), font=f_big)
+
+    # Card set
+    if card_set:
+        draw.text((30, 72), card_set, fill=(160, 160, 200), font=f_med)
+
+    # Divider line
+    draw.rectangle([30, 108, W - 30, 110], fill=(70, 70, 110))
+
+    # Harga USD besar
+    usd_text = f"${price_usd:.2f}"
+    draw.text((30, 125), usd_text, fill=GOLD, font=load_font(48, bold=True))
+
+    # Harga IDR
+    idr_text = f"Rp {price_idr:,.0f}"
+    draw.text((30, 185), idr_text, fill=(130, 190, 255), font=f_med)
+
+    # Kondisi & grade chip
+    info_parts = []
+    if condition:
+        info_parts.append(condition)
+    if psa_grade:
+        info_parts.append(f"PSA {psa_grade}")
+    if info_parts:
+        chip_text = "  ".join(info_parts)
+        draw.text((30, 222), chip_text, fill=(80, 220, 120), font=f_sm)
+
+    # Dekorasi: Pokéball outline kanan
+    cx, cy, r = 700, 160, 80
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(50, 50, 90), width=2)
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=GOLD, width=1)
+    draw.rectangle([cx - r, cy - 3, cx + r, cy + 3], fill=(50, 50, 90))
+    draw.rectangle([cx - r + 1, cy - 2, cx + r - 1, cy + 2], fill=GOLD)
+    draw.ellipse([cx - 18, cy - 18, cx + 18, cy + 18], outline=GOLD, width=1)
+
+    # Watermark
+    draw.text((30, H - 32), "PokeDex Price Bot", fill=(50, 50, 80), font=f_tiny)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def share_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "🎨 Format: `/share \\<id\\>`\n_Contoh: `/share 4`_\n\nID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, price_idr, condition, psa_grade "
+            "FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, card_set, price_usd, price_idr, condition, psa_grade = row
+    status_msg = await update.message.reply_text("🎨 Generating gambar\\.\\.\\.", parse_mode="MarkdownV2")
+
+    try:
+        img_bytes = await asyncio.to_thread(
+            _generate_share_image,
+            card_name, card_set or "", price_usd or 0, price_idr or 0,
+            condition or "Near Mint", psa_grade or "",
+        )
+        caption_parts = [f"🃏 *{card_name}*"]
+        if card_set:
+            caption_parts.append(f"📦 {card_set}")
+        if psa_grade:
+            caption_parts.append(f"🏆 PSA {psa_grade}")
+        caption_parts.append(f"💵 ${price_usd:.2f} | Rp {price_idr:,.0f}")
+        caption = "\n".join(caption_parts)
+
+        await update.message.reply_photo(
+            photo=io.BytesIO(img_bytes),
+            caption=caption,
+        )
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"share_card error: {e}", exc_info=True)
+        await status_msg.edit_text("⚠️ Gagal buat gambar bre\\. Coba lagi\\.", parse_mode="MarkdownV2")
+
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
@@ -3966,11 +4427,21 @@ def main() -> None:
 
     app.add_error_handler(global_error_handler)
 
+    # Commands baru v7
+    app.add_handler(CommandHandler("setphoto",   set_card_photo_cmd))
+    app.add_handler(CommandHandler("editkartu",  editkartu_cmd))
+    app.add_handler(CommandHandler("portfolio",  show_portfolio))
+    app.add_handler(CommandHandler("setalert",   setalert_persen))
+    app.add_handler(CommandHandler("share",      share_card))
+    app.add_handler(CallbackQueryHandler(editkartu_nama_cb,  pattern=r"^editkartu_nama:"))
+    app.add_handler(CallbackQueryHandler(editkartu_harga_cb, pattern=r"^editkartu_harga:"))
+    app.add_handler(CallbackQueryHandler(editkartu_batal_cb, pattern=r"^editkartu_batal:"))
+
     # Background jobs
     jq = app.job_queue
     jq.run_repeating(auto_snapshot_all, interval=86400, first=60)   # snapshot harian
 
-    logger.info("Bot Pokémon Vision & Portfolio v6 aktif! (+hargalokal, AI grading, portohistory, CSV import, saraanjual)")
+    logger.info("Bot Pokémon Vision & Portfolio v7 aktif! (+setphoto, editkartu, portfolio, setalert, share, cari inventory)")
     app.run_polling()
 
 if __name__ == "__main__":
