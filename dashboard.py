@@ -268,6 +268,10 @@ def api_wishlist():
     return jsonify([dict(r) for r in rows])
 
 # ─── Frontend HTML ────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML)
+
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="id">
 <head>
