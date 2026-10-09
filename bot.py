@@ -2510,27 +2510,37 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     # ── Cek pending_manual_edit_nama ──────────────────────────────────────────
     _edit_nama = await pop_ustate(user_id, "pending_manual_edit_nama")
     if _edit_nama is not None:
-        _edit_nama["name"] = text
-        await set_ustate(user_id, "pending_manual_confirm", _edit_nama)
-        await _show_manual_confirm(update.message, user_id, _edit_nama)
+        try:
+            _edit_nama["name"] = text
+            await set_ustate(user_id, "pending_manual_confirm", _edit_nama)
+            await _show_manual_confirm(update.message, user_id, _edit_nama)
+        except Exception as e:
+            logger.error(f"[edit_nama] Error: {e}", exc_info=True)
+            # Kembalikan state supaya user bisa coba lagi
+            await set_ustate(user_id, "pending_manual_edit_nama", _edit_nama)
+            await update.message.reply_text("⚠️ Ada error bre, coba ketik nama lagi\\.", parse_mode="MarkdownV2")
         return
 
     # ── Cek pending_manual_edit_harga ─────────────────────────────────────────
     card_name = await get_ustate(user_id, "pending_manual_edit_harga")
     if card_name is not None:
-        await del_ustate(user_id, "pending_manual_edit_harga")
         try:
             price_idr = parse_rupiah(text)
+            if price_idr <= 0:
+                raise ValueError("harga nol")
             price_usd = round(price_idr / EXCHANGE_RATE, 2)
             data      = {"name": card_name, "price_idr": price_idr, "price_usd": price_usd}
             await set_ustate(user_id, "pending_manual_confirm", data)
             await _show_manual_confirm(update.message, user_id, data)
+            await del_ustate(user_id, "pending_manual_edit_harga")  # hapus SETELAH berhasil
         except (ValueError, ZeroDivisionError):
-            await set_ustate(user_id, "pending_manual_edit_harga", card_name)
             await update.message.reply_text(
                 "⚠️ Masukkan angka Rupiah yang valid bre\\!\n_Contoh: `900000`_",
                 parse_mode="MarkdownV2",
             )
+        except Exception as e:
+            logger.error(f"[edit_harga] Error: {e}", exc_info=True)
+            await update.message.reply_text("⚠️ Ada error bre, coba ketik harga lagi\\.", parse_mode="MarkdownV2")
         return
 
     # ── Cek pending_manual_price: user ketik harga IDR ──────────────────────────
@@ -2542,12 +2552,19 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
                 raise ValueError("harga nol")
             price_usd = round(price_idr / EXCHANGE_RATE, 2)
             data      = {"name": card_name_pending, "price_idr": price_idr, "price_usd": price_usd}
-            await del_ustate(user_id, "pending_manual_price")
             await set_ustate(user_id, "pending_manual_confirm", data)
             await _show_manual_confirm(update.message, user_id, data)
+            await del_ustate(user_id, "pending_manual_price")  # hapus SETELAH berhasil kirim
         except (ValueError, ZeroDivisionError):
             await update.message.reply_text(
                 "⚠️ Masukkan angka Rupiah yang valid bre\\!\n_Contoh: `900000`_",
+                parse_mode="MarkdownV2",
+            )
+        except Exception as e:
+            logger.error(f"[pending_manual_price] Error untuk user {user_id}: {e}", exc_info=True)
+            # State TIDAK dihapus → user bisa ketik ulang
+            await update.message.reply_text(
+                "⚠️ Gagal kirim konfirmasi bre\\. Coba ketik nominalnya lagi\\:",
                 parse_mode="MarkdownV2",
             )
         return
@@ -2556,12 +2573,18 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     _photo_name_flag = await pop_ustate(user_id, "pending_photo_name")
     if _photo_name_flag:
         # Langsung minta harga, tidak perlu cari API
-        await set_ustate(user_id, "pending_manual_price", text)  # simpan nama langsung
-        await update.message.reply_text(
-            f"✅ Nama kartu: *{esc(text)}*\n\n"
-            f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
-            parse_mode="MarkdownV2",
-        )
+        try:
+            await set_ustate(user_id, "pending_manual_price", text)  # simpan nama langsung
+            await update.message.reply_text(
+                f"✅ Nama kartu: *{esc(text)}*\n\n"
+                f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
+                parse_mode="MarkdownV2",
+            )
+        except Exception as e:
+            logger.error(f"[photo_name] Error: {e}", exc_info=True)
+            # Kembalikan flag supaya user bisa coba lagi
+            await set_ustate(user_id, "pending_photo_name", True)
+            await update.message.reply_text("⚠️ Ada error bre, coba ketik nama kartunya lagi\\.", parse_mode="MarkdownV2")
         return
 
     # ── Cek pending_buy: user balas harga modal setelah klik "Simpan + Set Modal" ──
@@ -3863,6 +3886,20 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO,                      handle_photo_search))
     app.add_handler(MessageHandler(filters.Document.ALL,               handle_csv_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,    handle_card_search_v4))
+
+    # Global error handler — tangkap semua exception yang lolos dari handler
+    async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Unhandled exception:", exc_info=context.error)
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ Ada error tak terduga bre\\. Coba lagi atau ketik `/start`\\.",
+                    parse_mode="MarkdownV2",
+                )
+            except Exception:
+                pass  # jangan crash error handler itu sendiri
+
+    app.add_error_handler(global_error_handler)
 
     # Background jobs
     jq = app.job_queue
