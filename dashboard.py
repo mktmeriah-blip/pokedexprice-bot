@@ -21,31 +21,30 @@ def _find_db() -> str:
     # 1. Env var override
     if os.getenv("DB_PATH"):
         return os.getenv("DB_PATH")
-    # 2. Folder yang sama dengan dashboard.py
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pokedex.db")
-    if os.path.exists(here):
-        return here
+    # 2. Folder yang sama dengan dashboard.py — cek semua nama DB yang mungkin
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in ("pokemon_inventory.db", "pokedex.db", "inventory.db"):
+        p = os.path.join(script_dir, name)
+        if os.path.exists(p):
+            return p
     # 3. Lokasi umum Termux / home
     home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, "pokedex.db"),
-        os.path.join(home, "bot", "pokedex.db"),
-        os.path.join(home, "pokedexeprice-bot", "pokedex.db"),
-        os.path.join(home, "pokedex-bot", "pokedex.db"),
-        os.path.join(home, "PokeDexPrice", "pokedex.db"),
-        os.path.join(home, "pokedexprice-bot", "pokedex.db"),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
-    # 4. Cari di seluruh home (max depth 4)
-    found = glob.glob(os.path.join(home, "**", "pokedex.db"), recursive=True)
-    if found:
-        # Pilih yang terbaru (paling baru dimodifikasi)
-        found.sort(key=os.path.getmtime, reverse=True)
-        return found[0]
-    # Fallback — pakai path default walau gak ada (akan error saat query)
-    return here
+    bot_dirs = ["", "bot", "pokedexprice-bot", "pokedex-bot", "PokeDexPrice",
+                "pokedexeprice-bot", "pokemon-bot"]
+    db_names = ["pokemon_inventory.db", "pokedex.db", "inventory.db"]
+    for d in bot_dirs:
+        for n in db_names:
+            p = os.path.join(home, d, n) if d else os.path.join(home, n)
+            if os.path.exists(p):
+                return p
+    # 4. Cari di seluruh home (semua nama DB)
+    for name in db_names:
+        found = glob.glob(os.path.join(home, "**", name), recursive=True)
+        if found:
+            found.sort(key=os.path.getmtime, reverse=True)
+            return found[0]
+    # Fallback
+    return os.path.join(script_dir, "pokemon_inventory.db")
 
 DB_PATH = _find_db()
 RATE    = int(os.getenv("EXCHANGE_RATE", "16000"))
