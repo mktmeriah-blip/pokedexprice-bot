@@ -96,10 +96,12 @@ async def init_db() -> None:
             )
         """)
         for col, definition in [
-            ("condition",     "TEXT DEFAULT 'Near Mint'"),
-            ("psa_grade",     "TEXT DEFAULT NULL"),
-            ("buy_price_usd", "REAL DEFAULT 0.0"),
-            ("photo_file_id", "TEXT DEFAULT NULL"),
+            ("condition",          "TEXT DEFAULT 'Near Mint'"),
+            ("psa_grade",          "TEXT DEFAULT NULL"),
+            ("buy_price_usd",      "REAL DEFAULT 0.0"),
+            ("photo_file_id",      "TEXT DEFAULT NULL"),
+            ("photo_file_id_back", "TEXT DEFAULT NULL"),
+            ("tags",               "TEXT DEFAULT NULL"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE inventory ADD COLUMN {col} {definition}")
@@ -214,6 +216,20 @@ async def init_db() -> None:
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ustate_user ON user_states(user_id)")
+
+        # ── Reminders (fitur /remind) ─────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                card_id     INTEGER NOT NULL,
+                card_name   TEXT    NOT NULL,
+                remind_at   TEXT    NOT NULL,
+                sent        INTEGER DEFAULT 0,
+                created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, remind_at, sent)")
 
         await db.commit()
 
@@ -1118,6 +1134,35 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return  # jangan lanjut ke OCR flow
 
+    # ── Intercept /setphoto2 flow (foto belakang) ─────────────────────────────
+    setphoto_back_id = await pop_ustate(user_id, "pending_setphoto_back_id")
+    if setphoto_back_id is not None:
+        if not update.message.photo:
+            await update.message.reply_text("⚠️ Kirim foto bre, bukan file\\.", parse_mode="MarkdownV2")
+            await set_ustate(user_id, "pending_setphoto_back_id", setphoto_back_id)
+            return
+        file_id = update.message.photo[-1].file_id
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT card_name FROM inventory WHERE id=? AND user_id=?",
+                (setphoto_back_id, user_id),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                await db.execute(
+                    "UPDATE inventory SET photo_file_id_back=? WHERE id=? AND user_id=?",
+                    (file_id, setphoto_back_id, user_id),
+                )
+                await db.commit()
+                await update.message.reply_photo(
+                    photo=file_id,
+                    caption=f"✅ Foto belakang *{esc(row[0])}* \\(ID: \\#{setphoto_back_id}\\) berhasil disimpan\\!\n_Lihat dengan /photo {setphoto_back_id}_",
+                    parse_mode="MarkdownV2",
+                )
+            else:
+                await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+
     # Simpan file_id foto terbesar (kualitas terbaik) untuk disimpan ke inventory nanti
     if update.message.photo:
         await set_ustate(user_id, "pending_photo_file_id", update.message.photo[-1].file_id)
@@ -1273,7 +1318,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, photo_file_id FROM inventory WHERE user_id=? ORDER BY id",
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, photo_file_id, tags FROM inventory WHERE user_id=? ORDER BY id",
             (user_id,),
         ) as cur:
             items = await cur.fetchall()
@@ -1289,16 +1334,20 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     total_idr = sum(r[4] for r in items)
 
     lines = ["📦 *Portfolio Koleksi Pokémon:*\n"]
-    for idx, (inv_id, name, card_set, p_usd, p_idr, condition, psa_grade, photo_file_id) in enumerate(items, 1):
+    for idx, (inv_id, name, card_set, p_usd, p_idr, condition, psa_grade, photo_file_id, tags) in enumerate(items, 1):
         usd_str   = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str   = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
         grade_str = f" \\| 🏆 PSA {esc(psa_grade)}" if psa_grade else ""
-        photo_str = f" 📷 _/photo {inv_id}_" if photo_file_id else ""
-        set_str = f" \\({esc(card_set)}\\)" if card_set else ""
+        photo_str = f" 📷" if photo_file_id else ""
+        set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
+        # Build middle rows; tag gets its own ├ line
+        mid_rows  = f"   ├ {cond_str}{grade_str}{photo_str}\n"
+        if tags:
+            mid_rows += f"   ├ 🔖 _{esc(tags)}_\n"
         lines.append(
             f"{idx}\\. *{esc(name)}*{set_str}\n"
-            f"   ├ 🏷️ {cond_str}{grade_str}{photo_str}\n"
+            f"{mid_rows}"
             f"   └ 💵 {usd_str} \\| {idr_str}\n"
         )
 
@@ -1328,18 +1377,19 @@ async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT card_name, card_set, price_usd, photo_file_id FROM inventory WHERE id=? AND user_id=?",
+            "SELECT card_name, card_set, price_usd, photo_file_id, photo_file_id_back FROM inventory WHERE id=? AND user_id=?",
             (card_id, user_id),
         ) as cur:
             row = await cur.fetchone()
     if not row:
         await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
-    card_name, card_set, price_usd, photo_file_id = row
-    if not photo_file_id:
+    card_name, card_set, price_usd, photo_file_id, photo_file_id_back = row
+    if not photo_file_id and not photo_file_id_back:
         await update.message.reply_text(
             f"📷 *{esc(card_name)}* belum punya foto tersimpan bre\\.\n"
-            f"_Foto disimpan otomatis saat kamu kirim foto kartu lalu simpan ke inventory\\._",
+            f"_Tambah foto depan: /setphoto {card_id}_\n"
+            f"_Tambah foto belakang: /setphoto2 {card_id}_",
             parse_mode="MarkdownV2",
         )
         return
@@ -1348,11 +1398,19 @@ async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         + (f" \\| {esc(card_set)}" if card_set else "")
         + (f"\n💵 {esc_usd(price_usd)}" if price_usd and price_usd > 0 else "")
     )
-    await update.message.reply_photo(
-        photo=photo_file_id,
-        caption=caption,
-        parse_mode="MarkdownV2",
-    )
+    if photo_file_id:
+        has_back = " \\| _/photo2 {card_id} untuk belakang_" if photo_file_id_back else ""
+        await update.message.reply_photo(
+            photo=photo_file_id,
+            caption=caption + (f"\n_Foto belakang: /photo2 {card_id}_" if photo_file_id_back else ""),
+            parse_mode="MarkdownV2",
+        )
+    elif photo_file_id_back:
+        await update.message.reply_photo(
+            photo=photo_file_id_back,
+            caption=caption + "\n_\\(hanya foto belakang tersedia\\)_",
+            parse_mode="MarkdownV2",
+        )
 
 # ── /refresh ──────────────────────────────────────────────────────────────────
 async def refresh_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4347,6 +4405,652 @@ async def share_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await status_msg.edit_text("⚠️ Gagal buat gambar bre\\. Coba lagi\\.", parse_mode="MarkdownV2")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── v8 FEATURES ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── /setphoto2 <id> — set foto belakang ──────────────────────────────────────
+async def set_card_photo2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "📸 Format: `/setphoto2 \\<id\\>`\n_Contoh: `/setphoto2 4`_\n\nID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+    await set_ustate(user_id, "pending_setphoto_back_id", card_id)
+    await update.message.reply_text(
+        f"📸 Siap update *foto belakang* kartu *{esc(row[0])}* \\(ID: \\#{card_id}\\)\\!\n\n"
+        f"Sekarang *kirim fotonya* bre 👇",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /photo2 <id> — lihat foto belakang ───────────────────────────────────────
+async def show_card_photo2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Format: `/photo2 \\<id\\>`\n_Contoh: `/photo2 3`_\n\nID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, photo_file_id_back FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+    card_name, card_set, price_usd, photo_back = row
+    if not photo_back:
+        await update.message.reply_text(
+            f"📷 *{esc(card_name)}* belum punya foto belakang bre\\.\n"
+            f"_Tambah dengan: /setphoto2 {card_id}_",
+            parse_mode="MarkdownV2",
+        )
+        return
+    caption = (
+        f"📷 *{esc(card_name)}* \\(belakang\\)"
+        + (f" \\| {esc(card_set)}" if card_set else "")
+        + (f"\n💵 {esc_usd(price_usd)}" if price_usd and price_usd > 0 else "")
+    )
+    await update.message.reply_photo(
+        photo=photo_back,
+        caption=caption,
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /updateharga — update semua harga market inventory ───────────────────────
+async def updateharga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd FROM inventory WHERE user_id=? ORDER BY id",
+            (user_id,),
+        ) as cur:
+            cards = await cur.fetchall()
+
+    if not cards:
+        await update.message.reply_text("📂 Inventory kosong bre\\.", parse_mode="MarkdownV2")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"🔄 Update harga *{len(cards)} kartu*\\.\\.\\.\n_Ini mungkin butuh beberapa menit_",
+        parse_mode="MarkdownV2",
+    )
+
+    updated, failed, changes = 0, 0, []
+    for card_id, card_name, card_set, old_usd in cards:
+        result = await search_pokemon_card(card_name)
+        if result and not (isinstance(result, dict) and result.get("error")):
+            new_usd = result.get("price_usd") or 0
+            if new_usd > 0:
+                new_idr = round(new_usd * EXCHANGE_RATE)
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE inventory SET price_usd=?, price_idr=? WHERE id=? AND user_id=?",
+                        (new_usd, new_idr, card_id, user_id),
+                    )
+                    await db.execute(
+                        "INSERT INTO price_history (user_id, card_name, card_set, price_usd, price_idr) VALUES (?,?,?,?,?)",
+                        (user_id, card_name, card_set, new_usd, new_idr),
+                    )
+                    await db.commit()
+                updated += 1
+                diff = new_usd - (old_usd or 0)
+                if abs(diff) > 0.01:
+                    arrow = "📈" if diff > 0 else "📉"
+                    changes.append(f"{arrow} *{esc(card_name)}*: {esc_usd(old_usd or 0)} → {esc_usd(new_usd)}")
+            else:
+                failed += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.3)  # rate limit protection
+
+    change_text = "\n".join(changes[:15]) if changes else "_Tidak ada perubahan signifikan_"
+    if len(changes) > 15:
+        change_text += f"\n_\\.\\.\\. \\+{len(changes)-15} lainnya_"
+
+    await status_msg.edit_text(
+        f"✅ *Update Harga Selesai\\!*\n\n"
+        f"🔄 Diperbarui: *{updated}* kartu\n"
+        f"⚠️ Tidak ada data: *{failed}* kartu\n\n"
+        f"📊 *Perubahan:*\n{change_text}",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /prediksi <nama> — trend analysis + rekomendasi ──────────────────────────
+async def prediksi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "📊 Format: `/prediksi \\<nama\\>`\n_Contoh: `/prediksi Pikachu`_",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    card_name = " ".join(context.args)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT price_usd, recorded_at FROM price_history
+               WHERE user_id=? AND LOWER(card_name) LIKE LOWER(?)
+               ORDER BY recorded_at ASC LIMIT 60""",
+            (user_id, f"%{card_name}%"),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    # Fetch current market price
+    market = await search_pokemon_card(card_name)
+    current_usd = 0.0
+    if market and not (isinstance(market, dict) and market.get("error")):
+        current_usd = market.get("price_usd") or 0
+
+    if not rows or len(rows) < 2:
+        current_str = f" Harga pasar saat ini: {esc_usd(current_usd)}" if current_usd > 0 else ""
+        await update.message.reply_text(
+            f"📊 *{esc(card_name)}*\n\n"
+            f"⚠️ Data history minimal 2 titik dibutuhkan untuk prediksi\\.\n"
+            f"{current_str}\n\n"
+            f"_Gunakan /refresh untuk simpan data harga ke history_",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    prices = [r[0] for r in rows]
+    dates  = [r[1] for r in rows]
+    n      = len(prices)
+
+    first_price = prices[0]
+    last_price  = prices[-1]
+    avg_price   = sum(prices) / n
+    min_price   = min(prices)
+    max_price   = max(prices)
+
+    # Simple linear regression slope
+    x_vals = list(range(n))
+    x_mean = (n - 1) / 2.0
+    y_mean = avg_price
+    num = sum((x_vals[i] - x_mean) * (prices[i] - y_mean) for i in range(n))
+    den = sum((x_vals[i] - x_mean) ** 2 for i in range(n))
+    slope = num / den if den else 0
+
+    change_pct = ((last_price - first_price) / first_price * 100) if first_price > 0 else 0
+
+    # Predict next price (next data point)
+    predicted = last_price + slope
+    predicted_idr = round(predicted * EXCHANGE_RATE)
+
+    # Recommendation
+    if change_pct >= 15:
+        rekomendasi = "🟢 *JUAL* — Harga naik signifikan\\! Waktu bagus untuk jual\\."
+        trend_emoji = "📈"
+    elif change_pct >= 5:
+        rekomendasi = "🟡 *HOLD* — Harga naik, tunggu lebih tinggi atau jual sekarang\\."
+        trend_emoji = "📈"
+    elif change_pct <= -15:
+        rekomendasi = "🔵 *BELI* — Harga turun banyak\\! Kesempatan beli sekarang\\."
+        trend_emoji = "📉"
+    elif change_pct <= -5:
+        rekomendasi = "🟡 *HOLD* — Harga sedang turun, tunggu lebih rendah dulu\\."
+        trend_emoji = "📉"
+    else:
+        rekomendasi = "⚪ *HOLD* — Harga stabil, tidak ada sinyal kuat beli/jual\\."
+        trend_emoji = "➡️"
+
+    date_from = dates[0][:10] if dates else "?"
+    date_to   = dates[-1][:10] if dates else "?"
+    change_sign = "+" if change_pct >= 0 else ""
+
+    lines = [
+        f"{trend_emoji} *Analisis Tren: {esc(card_name)}*",
+        f"",
+        f"📅 Data: {esc(date_from)} → {esc(date_to)} \\({n} titik\\)",
+        f"",
+        f"📊 *Ringkasan Harga \\(History\\)*",
+        f"├ Pertama: {esc_usd(first_price)}",
+        f"├ Terakhir: {esc_usd(last_price)}",
+        f"├ Rata\\-rata: {esc_usd(avg_price)}",
+        f"├ Min: {esc_usd(min_price)} \\| Max: {esc_usd(max_price)}",
+        f"└ Perubahan: *{esc(f'{change_sign}{change_pct:.1f}%')}*",
+        f"",
+    ]
+    if current_usd > 0:
+        lines.append(f"💹 Harga Pasar Saat Ini: {esc_usd(current_usd)}")
+    lines += [
+        f"🔮 Prediksi Berikutnya: *{esc_usd(max(predicted, 0))}* \\| Rp {max(predicted_idr, 0):,.0f}",
+        f"",
+        f"💡 *Rekomendasi*",
+        f"{rekomendasi}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /tag <id> <label> — label custom per kartu ───────────────────────────────
+async def tag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "🏷 Format: `/tag \\<id\\> \\<label\\>`\n"
+            "_Contoh: `/tag 4 favorit`_\n"
+            "_Hapus tag: `/tag 4 hapus`_\n\n"
+            "ID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    label = " ".join(context.args[1:])
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+            return
+        card_name = row[0]
+        if label.lower() in ("hapus", "clear", "delete"):
+            await db.execute(
+                "UPDATE inventory SET tags=NULL WHERE id=? AND user_id=?",
+                (card_id, user_id),
+            )
+            await db.commit()
+            await update.message.reply_text(
+                f"🗑️ Tag kartu *{esc(card_name)}* \\(\\#{card_id}\\) dihapus\\.",
+                parse_mode="MarkdownV2",
+            )
+        else:
+            await db.execute(
+                "UPDATE inventory SET tags=? WHERE id=? AND user_id=?",
+                (label, card_id, user_id),
+            )
+            await db.commit()
+            await update.message.reply_text(
+                f"🏷 Tag *\\#{esc(label)}* berhasil ditambahkan ke *{esc(card_name)}* \\(\\#{card_id}\\)\\!\n"
+                f"_Lihat di /inventory_",
+                parse_mode="MarkdownV2",
+            )
+
+
+# ── /remind <id> <hari> — reminder cek harga ─────────────────────────────────
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⏰ Format: `/remind \\<id\\> \\<hari\\>`\n"
+            "_Contoh: `/remind 4 7`_ \\(ingatkan 7 hari lagi\\)\n\n"
+            "ID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+        days    = int(context.args[1])
+        if days < 1 or days > 365:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Format salah\\. Gunakan: `/remind \\<id\\> \\<hari\\>`\n_Hari harus 1–365_",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+            return
+        card_name  = row[0]
+        remind_at  = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO reminders (user_id, card_id, card_name, remind_at) VALUES (?,?,?,?)",
+            (user_id, card_id, card_name, remind_at),
+        )
+        await db.commit()
+
+    await update.message.reply_text(
+        f"⏰ Reminder set\\!\n\n"
+        f"🃏 *{esc(card_name)}* \\(ID: \\#{card_id}\\)\n"
+        f"📅 Akan diingatkan dalam *{days} hari* \\({esc(remind_at[:10])}\\)",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Background job: kirim reminder yang sudah jatuh tempo."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, user_id, card_id, card_name, remind_at FROM reminders WHERE sent=0 AND remind_at <= ?",
+            (now_str,),
+        ) as cur:
+            due = await cur.fetchall()
+
+        for rem_id, user_id, card_id, card_name, remind_at in due:
+            try:
+                # Get current price
+                async with db.execute(
+                    "SELECT price_usd, price_idr FROM inventory WHERE id=? AND user_id=?",
+                    (card_id, user_id),
+                ) as cur2:
+                    inv_row = await cur2.fetchone()
+                price_str = ""
+                if inv_row:
+                    p_usd, p_idr = inv_row
+                    price_str = f"\n💵 Harga tercatat: {esc_usd(p_usd or 0)} \\| Rp {(p_idr or 0):,.0f}"
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"⏰ *Reminder Harga Kartu\\!*\n\n"
+                        f"🃏 *{esc(card_name)}* \\(ID: \\#{card_id}\\)\n"
+                        f"📅 Set pada: {esc(remind_at[:10])}\n"
+                        f"{price_str}\n\n"
+                        f"_Cek harga terbaru dengan /refresh atau /cari_"
+                    ),
+                    parse_mode="MarkdownV2",
+                )
+                await db.execute("UPDATE reminders SET sent=1 WHERE id=?", (rem_id,))
+            except Exception as e:
+                logger.error(f"check_reminders: gagal kirim reminder {rem_id}: {e}")
+        await db.commit()
+
+
+# ── /listing <id> — generate teks listing marketplace ─────────────────────────
+async def listing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "🛒 Format: `/listing \\<id\\>`\n_Contoh: `/listing 4`_\n\nID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, price_idr, condition, psa_grade, tags FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, card_set, price_usd, price_idr, condition, psa_grade, tags = row
+    price_idr_int = int(price_idr or 0)
+
+    # Build condition description
+    cond_desc_map = {
+        "Mint":             "kondisi Mint \\(mulus sempurna, belum pernah dipakai\\)",
+        "Near Mint":        "kondisi Near Mint \\(sangat bagus, disimpan dengan baik\\)",
+        "Lightly Played":   "kondisi Lightly Played \\(sedikit bekas pakai, masih bagus\\)",
+        "Moderately Played":"kondisi Moderately Played \\(ada bekas pakai tapi kartu masih jelas\\)",
+        "Heavily Played":   "kondisi Heavily Played \\(bekas pakai jelas\\)",
+        "Damaged":          "kondisi Damaged \\(ada kerusakan fisik\\)",
+    }
+    cond_line = cond_desc_map.get(condition or "Near Mint", f"kondisi {esc(condition or 'Near Mint')}")
+
+    # Hashtags
+    name_slug  = re.sub(r'[^a-zA-Z0-9]', '', card_name.lower())
+    set_slug   = re.sub(r'[^a-zA-Z0-9]', '', (card_set or "").lower())
+    grade_line = f"🏆 Grade: PSA {esc(psa_grade)} \\(card sudah di\\-grading PSA\\!\\)\n" if psa_grade else ""
+    tag_line   = f"🔖 Label: {esc(tags)}\n" if tags else ""
+    set_line   = f"📦 Set: {esc(card_set)}\n" if card_set else ""
+
+    listing_text = (
+        f"🃏 *\\[DIJUAL\\] {esc(card_name)}*\n"
+        f"{set_line}"
+        f"✨ Kartu {cond_line}\n"
+        f"{grade_line}"
+        f"{tag_line}"
+        f"💵 Harga: *Rp {price_idr_int:,}*\n\n"
+        f"Detail:\n"
+        f"• Kartu original Pokémon TCG\n"
+        f"• Sudah disimpan dalam sleeve pelindung\n"
+        f"• Siap kirim ke seluruh Indonesia\n"
+        f"• Bisa COD area sekitar \\(tanyakan dulu\\)\n\n"
+        f"Minat? Chat WA/Telegram dulu ya\\!\n\n"
+        f"\\#{esc(name_slug)} \\#pokemontcg \\#jualpokemon \\#pokemon"
+        + (f" \\#{esc(set_slug)}" if set_slug else "")
+        + (f" \\#psa{esc(psa_grade.replace(' ',''))}" if psa_grade else "")
+    )
+
+    await update.message.reply_text(
+        f"🛒 *Template Listing — {esc(card_name)}*\n\n"
+        f"_Copy teks di bawah ini untuk Tokopedia / Shopee / WA:_\n\n"
+        + listing_text,
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /exportpdf — export katalog PDF ──────────────────────────────────────────
+def _build_pdf_bytes(cards: list, username: str) -> bytes:
+    """Buat PDF katalog inventory. Dipanggil via asyncio.to_thread."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        raise ImportError("fpdf2")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, f"Pokemon TCG Inventory — {username}", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 6, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", ln=True, align="C")
+    pdf.ln(4)
+
+    # Table header
+    col_widths = [8, 60, 40, 22, 22, 20, 18]
+    headers    = ["No", "Nama Kartu", "Set", "USD", "IDR", "Kondisi", "PSA"]
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_fill_color(220, 220, 220)
+    for w, h in zip(col_widths, headers):
+        pdf.cell(w, 7, h, border=1, fill=True, align="C")
+    pdf.ln()
+
+    # Rows
+    pdf.set_font("Helvetica", "", 8)
+    fill = False
+    total_idr = 0.0
+    for idx, (card_id, name, card_set, p_usd, p_idr, cond, grade, tags) in enumerate(cards, 1):
+        total_idr += p_idr or 0
+        pdf.set_fill_color(245, 245, 245) if fill else pdf.set_fill_color(255, 255, 255)
+        row_data = [
+            str(idx),
+            name[:30],
+            (card_set or "")[:20],
+            f"${p_usd:.2f}" if p_usd else "-",
+            f"Rp{int(p_idr):,}" if p_idr else "-",
+            (cond or "NM")[:12],
+            (f"PSA {grade}" if grade else "-")[:8],
+        ]
+        for w, d in zip(col_widths, row_data):
+            pdf.cell(w, 6, d, border=1, fill=True)
+        pdf.ln()
+        fill = not fill
+
+    # Total
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, f"Total Koleksi: {len(cards)} kartu  |  Total Nilai: Rp {total_idr:,.0f}", ln=True)
+
+    return bytes(pdf.output())
+
+
+async def exportpdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id  = update.effective_user.id
+    username = update.effective_user.first_name or "User"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, tags "
+            "FROM inventory WHERE user_id=? ORDER BY id",
+            (user_id,),
+        ) as cur:
+            cards = await cur.fetchall()
+
+    if not cards:
+        await update.message.reply_text("📂 Inventory kosong bre\\.", parse_mode="MarkdownV2")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"📄 Membuat PDF katalog *{len(cards)} kartu*\\.\\.\\.",
+        parse_mode="MarkdownV2",
+    )
+    try:
+        pdf_bytes = await asyncio.to_thread(_build_pdf_bytes, cards, username)
+        filename  = f"inventory_{user_id}_{datetime.utcnow().strftime('%Y%m%d')}.pdf"
+        await update.message.reply_document(
+            document=io.BytesIO(pdf_bytes),
+            filename=filename,
+            caption=f"📄 Katalog Pokemon TCG — {len(cards)} kartu",
+        )
+        await status_msg.delete()
+    except ImportError:
+        await status_msg.edit_text(
+            "⚠️ Library *fpdf2* belum terinstall\\.\n\n"
+            "Install dulu dengan:\n`pip install fpdf2`\n\nLalu restart bot\\.",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error(f"exportpdf_cmd error: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"⚠️ Gagal buat PDF bre\\: {esc(str(e)[:100])}",
+            parse_mode="MarkdownV2",
+        )
+
+
+# ── /comparebulan — bandingkan nilai portfolio bulan ini vs bulan lalu ────────
+async def comparebulan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    now     = datetime.utcnow()
+    # First day of current month
+    first_this = now.replace(day=1, hour=0, minute=0, second=0)
+    # First day of last month
+    if first_this.month == 1:
+        first_last = first_this.replace(year=first_this.year - 1, month=12)
+    else:
+        first_last = first_this.replace(month=first_this.month - 1)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Portfolio snapshot bulan ini (earliest)
+        async with db.execute(
+            """SELECT total_usd, total_idr, snapped_at FROM portfolio_snapshots
+               WHERE user_id=? AND snapped_at >= ?
+               ORDER BY snapped_at ASC LIMIT 1""",
+            (user_id, first_this.strftime("%Y-%m-%d")),
+        ) as cur:
+            this_start = await cur.fetchone()
+
+        # Latest snapshot
+        async with db.execute(
+            """SELECT total_usd, total_idr, snapped_at FROM portfolio_snapshots
+               WHERE user_id=?
+               ORDER BY snapped_at DESC LIMIT 1""",
+            (user_id,),
+        ) as cur:
+            latest = await cur.fetchone()
+
+        # Snapshot bulan lalu (earliest of last month)
+        async with db.execute(
+            """SELECT total_usd, total_idr, snapped_at FROM portfolio_snapshots
+               WHERE user_id=? AND snapped_at >= ? AND snapped_at < ?
+               ORDER BY snapped_at ASC LIMIT 1""",
+            (user_id, first_last.strftime("%Y-%m-%d"), first_this.strftime("%Y-%m-%d")),
+        ) as cur:
+            last_month = await cur.fetchone()
+
+        # Current inventory total
+        async with db.execute(
+            "SELECT SUM(price_usd), SUM(price_idr), COUNT(*) FROM inventory WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            inv_row = await cur.fetchone()
+
+    cur_usd   = inv_row[0] or 0 if inv_row else 0
+    cur_idr   = inv_row[1] or 0 if inv_row else 0
+    cur_count = inv_row[2] or 0 if inv_row else 0
+
+    lines = [f"📅 *Perbandingan Portfolio Bulanan*\n"]
+
+    # Current
+    lines.append(f"📊 *Saat Ini*")
+    lines.append(f"├ Kartu: *{cur_count}*")
+    lines.append(f"└ Nilai: *{esc_usd(cur_usd)}* \\| Rp {cur_idr:,.0f}\n")
+
+    if last_month:
+        lm_usd  = last_month[0] or 0
+        lm_idr  = last_month[1] or 0
+        lm_date = last_month[2][:10]
+        diff_usd = cur_usd - lm_usd
+        diff_idr = cur_idr - lm_idr
+        pct      = (diff_usd / lm_usd * 100) if lm_usd > 0 else 0
+        arrow    = "📈" if diff_usd >= 0 else "📉"
+        sign     = "+" if diff_usd >= 0 else ""
+        lines.append(f"🗓 *Bulan Lalu* \\(sejak {esc(lm_date)}\\)")
+        lines.append(f"└ Nilai: {esc_usd(lm_usd)} \\| Rp {lm_idr:,.0f}\n")
+        lines.append(
+            f"{arrow} *Perubahan: {esc(f'{sign}{diff_usd:.2f}')} USD "
+            f"\\({esc(f'{sign}{pct:.1f}%')}\\)*\n"
+            f"   Rp {diff_idr:+,.0f}"
+        )
+    else:
+        lines.append(f"⚠️ Belum ada snapshot bulan lalu\\.\n_Jalankan bot setiap hari supaya data terekam otomatis\\._")
+
+    if this_start:
+        ts_usd  = this_start[0] or 0
+        ts_date = this_start[2][:10]
+        diff_month = cur_usd - ts_usd
+        sign_m     = "+" if diff_month >= 0 else ""
+        pct_m      = (diff_month / ts_usd * 100) if ts_usd > 0 else 0
+        lines.append(f"\n📆 *Awal Bulan Ini* \\({esc(ts_date)}\\): {esc_usd(ts_usd)}")
+        lines.append(f"   Δ bulan ini: *{esc(f'{sign_m}{diff_month:.2f}')} USD \\({esc(f'{sign_m}{pct_m:.1f}%')}\\)*")
+
+    lines.append(f"\n_Data dari snapshot harian otomatis\\. Snapshot terakhir: {esc((latest[2] if latest else 'belum ada')[:16])}_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
@@ -4437,11 +5141,23 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(editkartu_harga_cb, pattern=r"^editkartu_harga:"))
     app.add_handler(CallbackQueryHandler(editkartu_batal_cb, pattern=r"^editkartu_batal:"))
 
+    # Commands baru v8
+    app.add_handler(CommandHandler("setphoto2",   set_card_photo2_cmd))
+    app.add_handler(CommandHandler("photo2",      show_card_photo2))
+    app.add_handler(CommandHandler("updateharga", updateharga_cmd))
+    app.add_handler(CommandHandler("prediksi",    prediksi_cmd))
+    app.add_handler(CommandHandler("tag",         tag_cmd))
+    app.add_handler(CommandHandler("remind",      remind_cmd))
+    app.add_handler(CommandHandler("listing",     listing_cmd))
+    app.add_handler(CommandHandler("exportpdf",   exportpdf_cmd))
+    app.add_handler(CommandHandler("comparebulan",comparebulan_cmd))
+
     # Background jobs
     jq = app.job_queue
-    jq.run_repeating(auto_snapshot_all, interval=86400, first=60)   # snapshot harian
+    jq.run_repeating(auto_snapshot_all,  interval=86400, first=60)    # snapshot harian
+    jq.run_repeating(check_reminders,    interval=3600,  first=120)   # cek reminder tiap jam
 
-    logger.info("Bot Pokémon Vision & Portfolio v7 aktif! (+setphoto, editkartu, portfolio, setalert, share, cari inventory)")
+    logger.info("Bot Pokémon Vision & Portfolio v8 aktif! (+updateharga, prediksi, tag, multi-foto, remind, listing, exportpdf, comparebulan)")
     app.run_polling()
 
 if __name__ == "__main__":
