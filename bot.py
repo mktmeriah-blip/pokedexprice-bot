@@ -1339,14 +1339,14 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         idr_str   = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
         grade_str = f" \\| 🏆 PSA {esc(psa_grade)}" if psa_grade else ""
-        photo_str = f" 📷" if photo_file_id else ""
+        photo_str = f" \\| 📷 /photo {inv_id}" if photo_file_id else ""
         set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
         # Build middle rows; tag gets its own ├ line
         mid_rows  = f"   ├ {cond_str}{grade_str}{photo_str}\n"
         if tags:
             mid_rows += f"   ├ 🔖 _{esc(tags)}_\n"
         lines.append(
-            f"{idx}\\. *{esc(name)}*{set_str}\n"
+            f"{idx}\\. *{esc(name)}*{set_str} — `\\#{inv_id}`\n"
             f"{mid_rows}"
             f"   └ 💵 {usd_str} \\| {idr_str}\n"
         )
@@ -1354,6 +1354,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines.append(
         f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
         f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}*\n\n"
+        f"_ID \\(\\#\\) dipakai untuk: /listing /tag /remind /share /setphoto /editkartu_\n\n"
         f"⚙️ _/setcondition \\[no\\] \\[kondisi\\]_\n"
         f"🏆 _/setgrade \\[no\\] \\[grade\\]_\n"
         f"🗑️ _/delete \\[no\\]_ \\| 📥 _/export_"
