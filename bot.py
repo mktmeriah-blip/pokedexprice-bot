@@ -231,6 +231,29 @@ async def init_db() -> None:
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, remind_at, sent)")
 
+        # ── Tong sampah / soft-delete (fitur /trash + /restore) ──────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS deleted_inventory (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                orig_id            INTEGER,
+                user_id            INTEGER NOT NULL,
+                card_name          TEXT    NOT NULL,
+                card_set           TEXT,
+                price_usd          REAL    DEFAULT 0.0,
+                price_idr          REAL    DEFAULT 0.0,
+                condition          TEXT    DEFAULT 'Near Mint',
+                psa_grade          TEXT,
+                buy_price_usd      REAL    DEFAULT 0.0,
+                photo_file_id      TEXT,
+                photo_file_id_back TEXT,
+                tags               TEXT,
+                deleted_at         TEXT    DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trash_user ON deleted_inventory(user_id, deleted_at)"
+        )
+
         await db.commit()
 
 # ── Helper: get user language ─────────────────────────────────────────────────
@@ -2447,12 +2470,16 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text(msg, parse_mode="MarkdownV2")
 
-# ── /delete ───────────────────────────────────────────────────────────────────
+# ── /delete — soft delete ke tong sampah ─────────────────────────────────────
 async def delete_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
     if not context.args:
-        await update.message.reply_text("⚠️ Format: `/delete 1`", parse_mode="MarkdownV2")
+        await update.message.reply_text(
+            "⚠️ Format: `/delete \\<nomor\\>`\n_Contoh: `/delete 1`_\n\n"
+            "Kartu masuk tong sampah dulu, bisa di\\-restore dengan /trash",
+            parse_mode="MarkdownV2",
+        )
         return
     try:
         idx = int(context.args[0])
@@ -2461,18 +2488,155 @@ async def delete_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, card_name FROM inventory WHERE user_id=? ORDER BY id", (user_id,)) as cur:
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, "
+            "buy_price_usd, photo_file_id, photo_file_id_back, tags "
+            "FROM inventory WHERE user_id=? ORDER BY id",
+            (user_id,),
+        ) as cur:
             items = await cur.fetchall()
         if idx < 1 or idx > len(items):
             await update.message.reply_text("❌ Nomor tidak ditemukan\\.", parse_mode="MarkdownV2")
             return
-        db_id, card_name = items[idx - 1]
+
+        row = items[idx - 1]
+        db_id, card_name = row[0], row[1]
+
+        # Pindah ke tong sampah
+        await db.execute(
+            """INSERT INTO deleted_inventory
+               (orig_id, user_id, card_name, card_set, price_usd, price_idr,
+                condition, psa_grade, buy_price_usd, photo_file_id, photo_file_id_back, tags)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (db_id, user_id, row[1], row[2], row[3], row[4],
+             row[5], row[6], row[7], row[8], row[9], row[10]),
+        )
+        # Hapus dari inventory
         await db.execute("DELETE FROM inventory WHERE id=? AND user_id=?", (db_id, user_id))
+        # Ambil trash id yang baru dibuat
+        async with db.execute(
+            "SELECT id FROM deleted_inventory WHERE user_id=? AND orig_id=? ORDER BY id DESC LIMIT 1",
+            (user_id, db_id),
+        ) as cur:
+            trash_row = await cur.fetchone()
         await db.commit()
 
+    trash_id = trash_row[0] if trash_row else 0
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("↩️ Restore", callback_data=f"restore_card:{trash_id}"),
+        InlineKeyboardButton("🗑️ Hapus Permanen", callback_data=f"purge_card:{trash_id}"),
+    ]])
     await update.message.reply_text(
-        f"🗑️ *{esc(card_name)}* berhasil dihapus\\!",
+        f"🗑️ *{esc(card_name)}* dipindah ke tong sampah\\.\n\n"
+        f"_Auto\\-hapus permanen dalam 30 hari\\._",
         parse_mode="MarkdownV2",
+        reply_markup=keyboard,
+    )
+
+
+async def restore_card_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: restore kartu dari tong sampah ke inventory."""
+    query   = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    trash_id = int(query.data.split(":")[1])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, price_idr, condition, psa_grade, "
+            "buy_price_usd, photo_file_id, photo_file_id_back, tags "
+            "FROM deleted_inventory WHERE id=? AND user_id=?",
+            (trash_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await query.edit_message_text("⚠️ Kartu tidak ditemukan di tong sampah\\.", parse_mode="MarkdownV2")
+            return
+        await db.execute(
+            """INSERT INTO inventory
+               (user_id, card_name, card_set, price_usd, price_idr, condition,
+                psa_grade, buy_price_usd, photo_file_id, photo_file_id_back, tags)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (user_id, row[0], row[1], row[2], row[3], row[4],
+             row[5], row[6], row[7], row[8], row[9]),
+        )
+        await db.execute("DELETE FROM deleted_inventory WHERE id=?", (trash_id,))
+        await db.commit()
+
+    await query.edit_message_text(
+        f"✅ *{esc(row[0])}* berhasil di\\-restore ke inventory\\!\n"
+        f"_Cek dengan /inventory_",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def purge_card_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: hapus permanen dari tong sampah."""
+    query   = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    trash_id = int(query.data.split(":")[1])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM deleted_inventory WHERE id=? AND user_id=?",
+            (trash_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await query.edit_message_text("⚠️ Kartu tidak ditemukan\\.", parse_mode="MarkdownV2")
+            return
+        await db.execute("DELETE FROM deleted_inventory WHERE id=? AND user_id=?", (trash_id, user_id))
+        await db.commit()
+
+    await query.edit_message_text(
+        f"💀 *{esc(row[0])}* dihapus permanen\\.",
+        parse_mode="MarkdownV2",
+    )
+
+
+# ── /trash — lihat & restore kartu yang dihapus ───────────────────────────────
+async def show_trash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    # Auto-purge kartu > 30 hari
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM deleted_inventory WHERE user_id=? AND deleted_at < datetime('now', '-30 days')",
+            (user_id,),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT id, card_name, card_set, price_usd, deleted_at "
+            "FROM deleted_inventory WHERE user_id=? ORDER BY deleted_at DESC LIMIT 20",
+            (user_id,),
+        ) as cur:
+            items = await cur.fetchall()
+
+    if not items:
+        await update.message.reply_text(
+            "🗑️ Tong sampah kosong bre\\!\n_Kartu yang dihapus akan muncul di sini selama 30 hari\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+
+    lines = ["🗑️ *Tong Sampah* \\(30 hari terakhir\\)\n"]
+    keyboard_rows = []
+    for trash_id, name, card_set, price_usd, deleted_at in items:
+        set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
+        price_str = esc_usd(price_usd) if price_usd else "N/A"
+        date_str  = deleted_at[:10] if deleted_at else "?"
+        lines.append(f"• *{esc(name)}*{set_str} — {price_str} \\| _dihapus {esc(date_str)}_")
+        keyboard_rows.append([
+            InlineKeyboardButton(f"↩️ {name[:20]}", callback_data=f"restore_card:{trash_id}"),
+            InlineKeyboardButton("💀", callback_data=f"purge_card:{trash_id}"),
+        ])
+
+    lines.append(f"\n_↩️ Restore \\| 💀 Hapus permanen_")
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(keyboard_rows),
     )
 
 # ── /export ───────────────────────────────────────────────────────────────────
@@ -5152,6 +5316,10 @@ def main() -> None:
     app.add_handler(CommandHandler("listing",     listing_cmd))
     app.add_handler(CommandHandler("exportpdf",   exportpdf_cmd))
     app.add_handler(CommandHandler("comparebulan",comparebulan_cmd))
+    # Tong sampah (soft-delete + restore)
+    app.add_handler(CommandHandler("trash",       show_trash))
+    app.add_handler(CallbackQueryHandler(restore_card_cb, pattern=r"^restore_card:"))
+    app.add_handler(CallbackQueryHandler(purge_card_cb,   pattern=r"^purge_card:"))
 
     # Background jobs
     jq = app.job_queue
