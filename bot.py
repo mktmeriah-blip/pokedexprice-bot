@@ -102,6 +102,9 @@ async def init_db() -> None:
             ("photo_file_id",      "TEXT DEFAULT NULL"),
             ("photo_file_id_back", "TEXT DEFAULT NULL"),
             ("tags",               "TEXT DEFAULT NULL"),
+            ("notes",              "TEXT DEFAULT NULL"),
+            ("for_sale",           "INTEGER DEFAULT 0"),
+            ("ask_price_usd",      "REAL DEFAULT 0.0"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE inventory ADD COLUMN {col} {definition}")
@@ -1346,54 +1349,120 @@ async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 # ── /inventory ────────────────────────────────────────────────────────────────
-async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
+INV_PAGE_SIZE = 10
 
+def _inventory_nav_keyboard(page: int, total_pages: int):
+    """Return InlineKeyboardMarkup dengan tombol Prev/Next, atau None kalau 1 halaman."""
+    if total_pages <= 1:
+        return None
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"inv_page:{page - 1}"))
+    buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="inv_page:noop"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"inv_page:{page + 1}"))
+    return InlineKeyboardMarkup([buttons])
+
+
+async def _build_inventory_page(user_id: int, page: int) -> tuple:
+    """Fetch inventory dan build teks halaman ke-page (0-indexed).
+    Returns (text, actual_page, total_pages, total_cards).
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, photo_file_id, tags FROM inventory WHERE user_id=? ORDER BY id",
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, "
+            "psa_grade, photo_file_id, tags, notes, for_sale, ask_price_usd "
+            "FROM inventory WHERE user_id=? ORDER BY id",
             (user_id,),
         ) as cur:
             items = await cur.fetchall()
 
     if not items:
+        return ("📂 Inventory kosong\\! Tambah dengan `/add \\[nama\\]`\\.", 0, 0, 0)
+
+    total_usd   = sum(r[3] or 0 for r in items)
+    total_idr   = sum(r[4] or 0 for r in items)
+    total       = len(items)
+    total_pages = max(1, (total + INV_PAGE_SIZE - 1) // INV_PAGE_SIZE)
+    page        = max(0, min(page, total_pages - 1))
+    start       = page * INV_PAGE_SIZE
+    page_items  = items[start:start + INV_PAGE_SIZE]
+
+    header = f"📦 *Portfolio Koleksi Pokémon* \\(hal {page + 1}/{total_pages}\\):\n"
+    lines  = [header]
+
+    for global_idx, (inv_id, name, card_set, p_usd, p_idr,
+                     condition, psa_grade, photo_file_id, tags,
+                     notes, for_sale, ask_price) in enumerate(page_items, start + 1):
+        usd_str   = esc_usd(p_usd)   if (p_usd  or 0) > 0 else "N/A"
+        idr_str   = f"Rp {p_idr:,.0f}" if (p_idr or 0) > 0 else "N/A"
+        cond_str  = esc(condition or "Near Mint")
+        grade_str = f" \\| 🏆 PSA {esc(str(psa_grade))}" if psa_grade else ""
+        photo_str = f" \\| 📷 /photo {inv_id}" if photo_file_id else ""
+        set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
+        sale_str  = f" \\| 🏷️ _{esc_usd(ask_price or 0)}_" if for_sale else ""
+
+        mid_rows  = f"   ├ {cond_str}{grade_str}{photo_str}\n"
+        if tags:
+            mid_rows += f"   ├ 🔖 _{esc(tags)}_\n"
+        if notes:
+            mid_rows += f"   ├ 📝 _{esc(notes)}_\n"
+
+        lines.append(
+            f"{global_idx}\\. *{esc(name)}*{set_str} — `\\#{inv_id}`\n"
+            f"{mid_rows}"
+            f"   └ 💵 {usd_str} \\| {idr_str}{sale_str}\n"
+        )
+
+    # Footer hanya di halaman terakhir
+    if page == total_pages - 1:
+        lines.append(
+            f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
+            f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}* \\({total} kartu\\)\n\n"
+            f"_/note \\[id\\] \\[teks\\] • /forsale \\[id\\] \\[harga\\]_\n"
+            f"_/listing /tag /remind /share /setphoto /editkartu_"
+        )
+
+    return "\n".join(lines), page, total_pages, total
+
+
+async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    text, page, total_pages, total = await _build_inventory_page(user_id, 0)
+
+    if total == 0:
         await update.message.reply_text(
             "📂 Inventory kosong\\! Tambah dengan `/add \\[nama\\]`\\.",
             parse_mode="MarkdownV2",
         )
         return
 
-    total_usd = sum(r[3] for r in items)
-    total_idr = sum(r[4] for r in items)
+    kb = _inventory_nav_keyboard(page, total_pages)
+    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
 
-    lines = ["📦 *Portfolio Koleksi Pokémon:*\n"]
-    for idx, (inv_id, name, card_set, p_usd, p_idr, condition, psa_grade, photo_file_id, tags) in enumerate(items, 1):
-        usd_str   = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
-        idr_str   = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
-        cond_str  = esc(condition or "Near Mint")
-        grade_str = f" \\| 🏆 PSA {esc(psa_grade)}" if psa_grade else ""
-        photo_str = f" \\| 📷 /photo {inv_id}" if photo_file_id else ""
-        set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
-        # Build middle rows; tag gets its own ├ line
-        mid_rows  = f"   ├ {cond_str}{grade_str}{photo_str}\n"
-        if tags:
-            mid_rows += f"   ├ 🔖 _{esc(tags)}_\n"
-        lines.append(
-            f"{idx}\\. *{esc(name)}*{set_str} — `\\#{inv_id}`\n"
-            f"{mid_rows}"
-            f"   └ 💵 {usd_str} \\| {idr_str}\n"
-        )
 
-    lines.append(
-        f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-        f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}*\n\n"
-        f"_ID \\(\\#\\) dipakai untuk: /listing /tag /remind /share /setphoto /editkartu_\n\n"
-        f"⚙️ _/setcondition \\[no\\] \\[kondisi\\]_\n"
-        f"🏆 _/setgrade \\[no\\] \\[grade\\]_\n"
-        f"🗑️ _/delete \\[no\\]_ \\| 📥 _/export_"
-    )
+async def inventory_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: navigasi halaman inventory."""
+    query = update.callback_query
+    await query.answer()
 
-    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+    data = query.data  # "inv_page:<n>" atau "inv_page:noop"
+    if data == "inv_page:noop":
+        return
+
+    try:
+        page = int(data.split(":")[1])
+    except (IndexError, ValueError):
+        return
+
+    user_id = query.from_user.id
+    text, page, total_pages, _ = await _build_inventory_page(user_id, page)
+    kb = _inventory_nav_keyboard(page, total_pages)
+
+    try:
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+    except Exception:
+        pass  # pesan tidak berubah → abaikan
 
 # ── /photo <id> — Kirim foto kartu dari inventory ─────────────────────────────
 async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5227,6 +5296,595 @@ async def comparebulan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# v10 — UX, MANAJEMEN, ANALITIK LOKAL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── /menu — papan tombol interaktif ──────────────────────────────────────────
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📦 Inventory",     callback_data="menu:/inventory"),
+            InlineKeyboardButton("📊 Stats",         callback_data="menu:/stats"),
+        ],
+        [
+            InlineKeyboardButton("💰 ROI",           callback_data="menu:/roi"),
+            InlineKeyboardButton("🏆 Top 10",        callback_data="menu:/top10"),
+        ],
+        [
+            InlineKeyboardButton("📋 Wishlist",      callback_data="menu:/wishlist"),
+            InlineKeyboardButton("📈 Portfolio",     callback_data="menu:/portfolio"),
+        ],
+        [
+            InlineKeyboardButton("🏷️ For Sale",     callback_data="menu:/salejual"),
+            InlineKeyboardButton("🗑️ Trash",        callback_data="menu:/trash"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Winner/Loser",  callback_data="menu:/winnerloser"),
+            InlineKeyboardButton("📅 Rekap",         callback_data="menu:/rekap"),
+        ],
+        [
+            InlineKeyboardButton("📂 Album Set",     callback_data="menu:/albumset"),
+            InlineKeyboardButton("📚 Katalog",       callback_data="menu:/katalog"),
+        ],
+    ])
+    await update.message.reply_text(
+        "🎮 *PokéDex Price — Menu Utama*\n\n_Tap tombol untuk membuka fitur:_",
+        parse_mode="MarkdownV2",
+        reply_markup=keyboard,
+    )
+
+
+async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle tap tombol di /menu."""
+    query = update.callback_query
+    await query.answer()
+
+    cmd     = query.data.split(":", 1)[1]
+    uid     = query.from_user.id
+    msg     = query.message
+
+    if cmd == "/inventory":
+        text, page, total_pages, total = await _build_inventory_page(uid, 0)
+        if total == 0:
+            await msg.reply_text("📂 Inventory kosong\\! Tambah dengan `/add \\[nama\\]`\\.", parse_mode="MarkdownV2")
+        else:
+            kb = _inventory_nav_keyboard(page, total_pages)
+            await msg.reply_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+        return
+
+    if cmd == "/salejual":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COUNT(*), SUM(ask_price_usd) FROM inventory WHERE user_id=? AND for_sale=1",
+                (uid,)
+            ) as cur:
+                row = await cur.fetchone()
+        cnt, total_ask = (row[0] or 0), (row[1] or 0.0)
+        if cnt == 0:
+            await msg.reply_text(
+                "🏷️ Tidak ada kartu for sale\\.\n_Gunakan `/forsale <id> <harga>`_",
+                parse_mode="MarkdownV2"
+            )
+        else:
+            await msg.reply_text(
+                f"🏷️ *{cnt} kartu for sale* \\| Total ask: {esc_usd(total_ask)}\n"
+                f"_Ketik /salejual untuk daftar lengkap\\._",
+                parse_mode="MarkdownV2"
+            )
+        return
+
+    # Untuk command lain: kirim sebagai teks command Telegram (auto jadi link biru yg bisa di-tap)
+    hints = {
+        "/stats":       "📊 /stats",
+        "/roi":         "💰 /roi",
+        "/top10":       "🏆 /top10",
+        "/wishlist":    "📋 /wishlist",
+        "/portfolio":   "📈 /portfolio",
+        "/trash":       "🗑️ /trash",
+        "/winnerloser": "🏆 /winnerloser",
+        "/rekap":       "📅 /rekap",
+        "/albumset":    "📂 /albumset",
+        "/katalog":     "📚 /katalog",
+    }
+    await msg.reply_text(hints.get(cmd, cmd))
+
+
+# ── /note <id> [teks|hapus] — catatan per kartu ──────────────────────────────
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Gunakan:\n"
+            "`/note <id> <teks>` — simpan catatan\n"
+            "`/note <id> hapus` — hapus catatan\n"
+            "`/note <id>` — lihat catatan\n\n"
+            "_Contoh: `/note 5 beli di JakCard Expo`_",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    try:
+        card_id = int(args[0].lstrip('#'))
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, notes FROM inventory WHERE id=? AND user_id=?",
+            (card_id, uid)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text(f"⚠️ Kartu \\#{card_id} tidak ditemukan\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, existing_note = row
+
+    if len(args) == 1:
+        # Tampilkan catatan saat ini
+        if existing_note:
+            await update.message.reply_text(
+                f"📝 *Catatan {esc(card_name)}* `\\#{card_id}`:\n_{esc(existing_note)}_",
+                parse_mode="MarkdownV2"
+            )
+        else:
+            await update.message.reply_text(
+                f"📝 *{esc(card_name)}* belum punya catatan\\.\n"
+                f"_Gunakan `/note {card_id} <teks>` untuk menambah\\._",
+                parse_mode="MarkdownV2"
+            )
+        return
+
+    teks = " ".join(args[1:])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if teks.lower() == "hapus":
+            await db.execute(
+                "UPDATE inventory SET notes=NULL WHERE id=? AND user_id=?", (card_id, uid)
+            )
+            await db.commit()
+            await update.message.reply_text(
+                f"🗑️ Catatan *{esc(card_name)}* `\\#{card_id}` dihapus\\.",
+                parse_mode="MarkdownV2"
+            )
+        else:
+            await db.execute(
+                "UPDATE inventory SET notes=? WHERE id=? AND user_id=?", (teks, card_id, uid)
+            )
+            await db.commit()
+            await update.message.reply_text(
+                f"📝 Catatan *{esc(card_name)}* `\\#{card_id}` disimpan:\n_{esc(teks)}_",
+                parse_mode="MarkdownV2"
+            )
+
+
+# ── /forsale <id> <harga> — tandai kartu mau dijual ──────────────────────────
+async def forsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    args = context.args
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Gunakan: `/forsale <id> <harga_ask_USD>`\n"
+            "_Contoh: `/forsale 5 25.00`_\n\n"
+            "Tandai kartu sebagai mau dijual dengan harga ask\\.\n"
+            "Lihat semua: /salejual \\| Batal: /unsale \\<id\\>",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    try:
+        card_id   = int(args[0].lstrip('#'))
+        ask_price = float(args[1].replace(",", ""))
+        if ask_price < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Format: `/forsale <id> <harga>`", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, buy_price_usd FROM inventory WHERE id=? AND user_id=?",
+            (card_id, uid)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text(f"⚠️ Kartu \\#{card_id} tidak ditemukan\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, card_set, price_usd, buy_usd = row
+    ask_idr = ask_price * EXCHANGE_RATE
+    profit  = ask_price - (buy_usd or price_usd or 0)
+    sign_p  = "\\+" if profit >= 0 else ""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE inventory SET for_sale=1, ask_price_usd=? WHERE id=? AND user_id=?",
+            (ask_price, card_id, uid)
+        )
+        await db.commit()
+
+    set_str = f" \\({esc(card_set)}\\)" if card_set else ""
+    await update.message.reply_text(
+        f"🏷️ *{esc(card_name)}*{set_str} `\\#{card_id}` ditandai *FOR SALE*\\!\n\n"
+        f"Ask: *{esc_usd(ask_price)}* \\(Rp {ask_idr:,.0f}\\)\n"
+        f"Harga beli: {esc_usd(buy_usd or price_usd or 0)}\n"
+        f"Estimasi profit: *{sign_p}{esc(f'{profit:.2f}')} USD*\n\n"
+        f"_/salejual — lihat semua kartu dijual_\n"
+        f"_/unsale {card_id} — batal jual_",
+        parse_mode="MarkdownV2"
+    )
+
+
+# ── /unsale <id> — batalkan for-sale ─────────────────────────────────────────
+async def unsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid  = update.effective_user.id
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("Gunakan: `/unsale <id>`", parse_mode="MarkdownV2")
+        return
+
+    try:
+        card_id = int(args[0].lstrip('#'))
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM inventory WHERE id=? AND user_id=?", (card_id, uid)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text(f"⚠️ Kartu \\#{card_id} tidak ditemukan\\.", parse_mode="MarkdownV2")
+            return
+        await db.execute(
+            "UPDATE inventory SET for_sale=0, ask_price_usd=0 WHERE id=? AND user_id=?",
+            (card_id, uid)
+        )
+        await db.commit()
+
+    await update.message.reply_text(
+        f"✅ *{esc(row[0])}* `\\#{card_id}` dikeluarkan dari daftar jual\\.",
+        parse_mode="MarkdownV2"
+    )
+
+
+# ── /salejual — list semua kartu for sale ────────────────────────────────────
+async def salejual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT id, card_name, card_set, buy_price_usd, price_usd,
+                   ask_price_usd, condition, psa_grade, notes
+            FROM inventory
+            WHERE user_id=? AND for_sale=1
+            ORDER BY ask_price_usd DESC
+        """, (uid,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "🏷️ Tidak ada kartu yang sedang dijual\\.\n"
+            "_Gunakan `/forsale <id> <harga>` untuk menandai kartu\\._",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    total_ask = sum(r[5] or 0 for r in rows)
+    lines     = [f"🏷️ *KARTU FOR SALE* \\({len(rows)} kartu\\)\n"]
+
+    for inv_id, name, card_set, buy_usd, price_usd, ask_p, cond, grade, notes in rows:
+        set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
+        grade_str = f" \\| PSA {esc(str(grade))}" if grade else ""
+        base_usd  = buy_usd or price_usd or 0
+        profit    = (ask_p or 0) - base_usd
+        sign_p    = "\\+" if profit >= 0 else ""
+        note_str  = f"\n  📝 _{esc(notes)}_" if notes else ""
+        lines.append(
+            f"• *{esc(name)}*{set_str} `\\#{inv_id}`\n"
+            f"  {esc(cond)}{grade_str}\n"
+            f"  Ask: *{esc_usd(ask_p or 0)}* \\| Beli: {esc_usd(base_usd)}\n"
+            f"  💰 Profit: *{sign_p}{esc(f'{profit:.2f}')} USD*"
+            f"{note_str}"
+        )
+
+    lines.append(f"\n💵 *Total Ask: {esc_usd(total_ask)}*")
+    lines.append(f"_/listing \\[id\\] untuk teks marketplace_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /albumset — inventory dikelompokkan per set ───────────────────────────────
+async def albumset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT COALESCE(card_set, '(Tanpa Set)') as s,
+                   COUNT(*) as cnt,
+                   SUM(price_usd) as total_usd,
+                   SUM(price_idr) as total_idr
+            FROM inventory
+            WHERE user_id=?
+            GROUP BY s
+            ORDER BY total_usd DESC
+        """, (uid,)) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("📂 Inventory kosong\\.", parse_mode="MarkdownV2")
+        return
+
+    grand_usd   = sum(r[2] or 0 for r in rows)
+    grand_idr   = sum(r[3] or 0 for r in rows)
+    grand_count = sum(r[1] for r in rows)
+
+    lines = [f"📂 *Album per Set* \\({grand_count} kartu total\\)\n"]
+
+    for card_set, cnt, p_usd, p_idr in rows:
+        pct = ((p_usd or 0) / grand_usd * 100) if grand_usd > 0 else 0
+        filled = int(pct / 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+        lines.append(
+            f"📦 *{esc(card_set)}*  `{bar}` {esc(f'{pct:.0f}')}%\n"
+            f"   {cnt} kartu \\| {esc_usd(p_usd or 0)} \\| Rp {(p_idr or 0):,.0f}"
+        )
+
+    lines.append(f"\n💰 *Grand Total: {esc_usd(grand_usd)} \\| Rp {grand_idr:,.0f}*")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /rekap — rekap bulanan ───────────────────────────────────────────────────
+async def rekap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid      = update.effective_user.id
+    now      = datetime.now()
+    month_s  = now.strftime("%Y-%m")
+    month_nm = now.strftime("%B %Y")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Penjualan bulan ini
+        async with db.execute("""
+            SELECT COUNT(*), SUM(sell_price_usd), SUM(profit_usd)
+            FROM trade_log
+            WHERE user_id=? AND sold_at LIKE ?
+        """, (uid, f"{month_s}%")) as cur:
+            trade = await cur.fetchone()
+
+        # Portofolio saat ini
+        async with db.execute(
+            "SELECT SUM(price_usd), SUM(price_idr), COUNT(*) FROM inventory WHERE user_id=?", (uid,)
+        ) as cur:
+            porto = await cur.fetchone()
+
+        # Snapshot awal bulan (untuk delta)
+        async with db.execute("""
+            SELECT total_usd FROM portfolio_snapshots
+            WHERE user_id=? AND snapped_at LIKE ?
+            ORDER BY snapped_at ASC LIMIT 1
+        """, (uid, f"{month_s}%")) as cur:
+            snap = await cur.fetchone()
+
+        # Reminders pending bulan ini
+        async with db.execute(
+            "SELECT COUNT(*) FROM reminders WHERE user_id=? AND remind_at LIKE ? AND sent=0",
+            (uid, f"{month_s}%")
+        ) as cur:
+            rem_row = await cur.fetchone()
+
+        # For-sale saat ini
+        async with db.execute(
+            "SELECT COUNT(*), SUM(ask_price_usd) FROM inventory WHERE user_id=? AND for_sale=1", (uid,)
+        ) as cur:
+            sale_row = await cur.fetchone()
+
+        # Wishlist
+        async with db.execute("SELECT COUNT(*) FROM wishlist WHERE user_id=?", (uid,)) as cur:
+            wish_row = await cur.fetchone()
+
+    sold_cnt   = trade[0] or 0
+    sold_usd   = trade[1] or 0.0
+    profit_usd = trade[2] or 0.0
+    cur_usd    = porto[0] or 0.0
+    cur_idr    = porto[1] or 0.0
+    cur_count  = porto[2] or 0
+
+    lines = [f"📅 *Rekap Bulan {esc(month_nm)}*\n"]
+
+    # Portofolio
+    lines.append("💼 *Portofolio Sekarang*")
+    lines.append(f"   {cur_count} kartu \\| {esc_usd(cur_usd)} \\| Rp {cur_idr:,.0f}")
+    if snap and snap[0]:
+        delta   = cur_usd - snap[0]
+        sign    = "\\+" if delta >= 0 else ""
+        emoji_d = "📈" if delta >= 0 else "📉"
+        lines.append(f"   {emoji_d} Δ bulan ini: *{sign}{esc(f'{delta:.2f}')} USD*")
+
+    # Penjualan
+    lines.append("\n💸 *Penjualan Bulan Ini*")
+    if sold_cnt > 0:
+        sign_p = "\\+" if profit_usd >= 0 else ""
+        lines.append(f"   {sold_cnt} kartu dijual \\| Hasil: {esc_usd(sold_usd)}")
+        lines.append(f"   Profit: *{sign_p}{esc(f'{profit_usd:.2f}')} USD*")
+    else:
+        lines.append("   \\- Belum ada penjualan bulan ini")
+
+    # For sale & wishlist & reminders
+    sale_cnt  = sale_row[0] or 0
+    sale_ask  = sale_row[1] or 0.0
+    wish_cnt  = wish_row[0] if wish_row else 0
+    rem_cnt   = rem_row[0]  if rem_row  else 0
+
+    lines.append("\n📋 *Lainnya*")
+    if sale_cnt:
+        lines.append(f"   🏷️ For sale: {sale_cnt} kartu \\(ask {esc_usd(sale_ask)}\\)")
+    lines.append(f"   📌 Wishlist: {wish_cnt} kartu")
+    if rem_cnt:
+        lines.append(f"   ⏰ Reminder pending: {rem_cnt}")
+
+    lines.append("\n_/stats \\| /roi \\| /winnerloser \\| /riwayatjual_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /duplikatjual — rekomendasi jual duplikat terbaik ─────────────────────────
+async def duplikatjual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT LOWER(card_name) as lname,
+                   card_name,
+                   COUNT(*) as cnt,
+                   MIN(price_usd) as min_p,
+                   MAX(price_usd) as max_p
+            FROM inventory
+            WHERE user_id=?
+            GROUP BY lname
+            HAVING cnt >= 2
+            ORDER BY max_p DESC
+        """, (uid,)) as cur:
+            dupes = await cur.fetchall()
+
+    if not dupes:
+        await update.message.reply_text(
+            "✅ Tidak ada duplikat di inventory kamu\\. Semua kartu unik\\!",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # Untuk setiap duplikat: cari detail (ID + kondisi) untuk saran jual
+    COND_RANK = {
+        "Mint": 1, "Near Mint": 2, "Lightly Played": 3,
+        "Moderately Played": 4, "Heavily Played": 5, "Damaged": 6,
+    }
+
+    lines = ["🔄 *REKOMENDASI JUAL DUPLIKAT*\n", "_Simpan kondisi terbaik, jual yang lebih rendah:_\n"]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for lname, name, cnt, min_p, max_p in dupes:
+            async with db.execute("""
+                SELECT id, condition, price_usd FROM inventory
+                WHERE user_id=? AND LOWER(card_name)=?
+                ORDER BY price_usd DESC
+            """, (uid, lname)) as cur:
+                copies = await cur.fetchall()
+
+            # Urutkan: yang paling jelek kondisinya → saran jual pertama
+            copies_sorted = sorted(
+                copies,
+                key=lambda r: COND_RANK.get(r[1] or "Damaged", 6),
+                reverse=True
+            )
+            sell_id, sell_cond, sell_price = copies_sorted[0]
+            keep_id, keep_cond, keep_price = copies_sorted[-1]
+
+            lines.append(
+                f"• *{esc(name)}* \\({cnt}x\\)\n"
+                f"  💡 Jual `\\#{sell_id}` \\({esc(sell_cond or '?')}\\) {esc_usd(sell_price or 0)}\n"
+                f"  ✅ Simpan `\\#{keep_id}` \\({esc(keep_cond or '?')}\\) {esc_usd(keep_price or 0)}"
+            )
+
+    lines.append(f"\n_/jual \\[id\\] untuk menjual \\| /forsale \\[id\\] \\[harga\\] untuk listing_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── /hitung <harga> [kondisi] — kalkulator beli cepat ────────────────────────
+async def hitung_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "Gunakan: `/hitung <harga> [kondisi]`\n\n"
+            "Harga dalam USD \\(misal `15.50`\\) atau IDR \\(misal `250000`\\)\\.\n"
+            "Kondisi opsional: NM, LP, MP, HP, Mint, Damaged\n\n"
+            "_Contoh:_\n"
+            "`/hitung 15.00 NM`\n"
+            "`/hitung 250000`",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    try:
+        price_raw = float(args[0].replace(",", ""))
+        if price_raw < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Harga tidak valid\\.", parse_mode="MarkdownV2")
+        return
+
+    # Deteksi mata uang: nilai >= 1000 dianggap IDR
+    if price_raw >= 1000:
+        price_usd = price_raw / EXCHANGE_RATE
+        price_idr = price_raw
+    else:
+        price_usd = price_raw
+        price_idr = price_raw * EXCHANGE_RATE
+
+    # Match kondisi dari argumen
+    cond_input = " ".join(args[1:]).strip().lower() if len(args) > 1 else ""
+    cond_aliases = {
+        "nm": "Near Mint", "nearmint": "Near Mint",
+        "m": "Mint", "mint": "Mint",
+        "lp": "Lightly Played", "lightlyplayed": "Lightly Played",
+        "mp": "Moderately Played", "moderatelyplayed": "Moderately Played",
+        "hp": "Heavily Played", "heavilyplayed": "Heavily Played",
+        "d": "Damaged", "damaged": "Damaged",
+    }
+    cond_match = "Near Mint"
+    if cond_input:
+        key = cond_input.replace(" ", "").lower()
+        cond_match = cond_aliases.get(key) or next(
+            (c for c in CARD_CONDITIONS if cond_input in c.lower()), "Near Mint"
+        )
+
+    multiplier = CONDITION_MULTIPLIERS.get(cond_match, 1.0)
+    adj_usd    = price_usd * multiplier   # nilai riil dengan diskon kondisi
+    adj_idr    = price_idr * multiplier
+
+    # Harga NM-equivalent (seolah kondisi NM)
+    nm_equiv = price_usd / multiplier if multiplier > 0 else price_usd
+
+    # Skenario resale
+    sell_low = nm_equiv * 0.70
+    sell_mid = nm_equiv * 1.00
+    sell_hi  = nm_equiv * 1.30
+
+    roi = lambda sell: (sell - price_usd) / price_usd * 100 if price_usd > 0 else 0
+
+    # Verdict
+    if price_usd <= nm_equiv * 0.85:
+        verdict = "✅ *BELI* — harga di bawah nilai NM, margin bagus"
+    elif price_usd <= nm_equiv * 1.0:
+        verdict = "🟡 *PERTIMBANGKAN* — harga wajar, margin tipis"
+    else:
+        verdict = "⚠️ *MAHAL* — harga di atas nilai kondisi, resiko rugi"
+
+    disc_pct = (1 - multiplier) * 100
+
+    lines = [
+        f"🧮 *KALKULATOR BELI KARTU*\n",
+        f"💵 Harga beli: *{esc_usd(price_usd)}* \\(Rp {price_idr:,.0f}\\)",
+        f"📦 Kondisi: _{esc(cond_match)}_"
+        + (f" \\(diskon {esc(f'{disc_pct:.0f}')}%\\)" if disc_pct > 0 else ""),
+        f"📊 Nilai efektif: {esc_usd(adj_usd)} \\(Rp {adj_idr:,.0f}\\)",
+        f"📈 Setara NM: \\~{esc_usd(nm_equiv)}",
+        f"\n🔮 *Skenario Resale*",
+        f"   Konservatif \\(\\-30%\\): {esc_usd(sell_low)} → ROI *{esc(f'{roi(sell_low):+.1f}')}%*",
+        f"   Fair value: {esc_usd(sell_mid)} → ROI *{esc(f'{roi(sell_mid):+.1f}')}%*",
+        f"   Optimis \\(\\+30%\\): {esc_usd(sell_hi)} → ROI *{esc(f'{roi(sell_hi):+.1f}')}%*",
+        f"\n{verdict}",
+        f"\n_/add untuk tambah ke inventory_",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # v9 — FITUR LOKAL (tanpa API harga)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -5952,6 +6610,19 @@ def main() -> None:
     app.add_handler(CommandHandler("qr",                qr_cmd))
     app.add_handler(CommandHandler("katalog",           katalog_cmd))
 
+    # v10 — UX + Manajemen Koleksi + Analitik Lokal
+    app.add_handler(CommandHandler("menu",         menu_cmd))
+    app.add_handler(CommandHandler("note",         note_cmd))
+    app.add_handler(CommandHandler("forsale",      forsale_cmd))
+    app.add_handler(CommandHandler("unsale",       unsale_cmd))
+    app.add_handler(CommandHandler("salejual",     salejual_cmd))
+    app.add_handler(CommandHandler("albumset",     albumset_cmd))
+    app.add_handler(CommandHandler("rekap",        rekap_cmd))
+    app.add_handler(CommandHandler("duplikatjual", duplikatjual_cmd))
+    app.add_handler(CommandHandler("hitung",       hitung_cmd))
+    app.add_handler(CallbackQueryHandler(inventory_page_cb, pattern=r"^inv_page:"))
+    app.add_handler(CallbackQueryHandler(menu_cb,           pattern=r"^menu:"))
+
     # Background jobs
     jq = app.job_queue
     jq.run_repeating(auto_snapshot_all,  interval=86400, first=60)    # snapshot harian
@@ -5959,7 +6630,7 @@ def main() -> None:
     # Laporan harian pukul 08:00 (UTC+7 = 01:00 UTC)
     jq.run_daily(send_daily_report, time=__import__("datetime").time(1, 0, 0))
 
-    logger.info("Bot Pokémon Vision & Portfolio v9 aktif! (+winnerloser, setcomplete, graderekomendasi, tradein, daily, qr, katalog)")
+    logger.info("Bot Pokémon Vision & Portfolio v10 aktif! (+menu, note, forsale, unsale, salejual, albumset, rekap, duplikatjual, hitung)")
     app.run_polling()
 
 if __name__ == "__main__":
