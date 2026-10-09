@@ -11,12 +11,43 @@ Akses dari HP lain : http://<IP-lokal>:5000
 """
 
 import os
+import glob
 import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pokedex.db")
+# ─── Auto-detect DB ───────────────────────────────────────────────────────────
+def _find_db() -> str:
+    # 1. Env var override
+    if os.getenv("DB_PATH"):
+        return os.getenv("DB_PATH")
+    # 2. Folder yang sama dengan dashboard.py
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pokedex.db")
+    if os.path.exists(here):
+        return here
+    # 3. Lokasi umum Termux / home
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "pokedex.db"),
+        os.path.join(home, "bot", "pokedex.db"),
+        os.path.join(home, "pokedexeprice-bot", "pokedex.db"),
+        os.path.join(home, "pokedex-bot", "pokedex.db"),
+        os.path.join(home, "PokeDexPrice", "pokedex.db"),
+        os.path.join(home, "pokedexprice-bot", "pokedex.db"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    # 4. Cari di seluruh home (max depth 4)
+    found = glob.glob(os.path.join(home, "**", "pokedex.db"), recursive=True)
+    if found:
+        # Pilih yang terbaru (paling baru dimodifikasi)
+        found.sort(key=os.path.getmtime, reverse=True)
+        return found[0]
+    # Fallback — pakai path default walau gak ada (akan error saat query)
+    return here
+
+DB_PATH = _find_db()
 RATE    = int(os.getenv("EXCHANGE_RATE", "16000"))
 PORT    = int(os.getenv("DASHBOARD_PORT", "5000"))
 
@@ -833,11 +864,13 @@ async function loadAll() {
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    db_status = "✅ ditemukan" if os.path.exists(DB_PATH) else "❌ TIDAK ditemukan"
     print(f"""
 ╔════════════════════════════════════════╗
 ║  🎴  PokeDex Price — Web Dashboard    ║
 ╚════════════════════════════════════════╝
   Database : {DB_PATH}
+             {db_status}
   Rate     : Rp {RATE:,} / USD
   Port     : {PORT}
 
@@ -847,9 +880,9 @@ if __name__ == "__main__":
 
   Tekan Ctrl+C untuk stop.
 """)
-    # Cek DB
     if not os.path.exists(DB_PATH):
-        print(f"  ⚠️  PERINGATAN: database tidak ditemukan di {DB_PATH}")
-        print("  Pastikan dashboard.py ada di folder yang sama dengan pokedex.db\n")
+        print("  ⚠️  Database tidak ditemukan! Coba:")
+        print("  DB_PATH=/path/ke/pokedex.db python3 dashboard.py")
+        print("  Atau cari dengan: find ~ -name 'pokedex.db' 2>/dev/null\n")
 
     app.run(host="0.0.0.0", port=PORT, debug=False)
