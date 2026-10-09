@@ -42,9 +42,12 @@ load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.DEBUG,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN")
 EXCHANGE_RATE       = int(os.getenv("EXCHANGE_RATE", 16000))
@@ -218,21 +221,29 @@ async def get_user_lang(user_id: int) -> str:
 # ── Persistent user state helpers ────────────────────────────────────────────
 async def get_ustate(user_id: int, key: str):
     """Ambil pending state dari SQLite. Return None kalau tidak ada."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT state_val FROM user_states WHERE user_id=? AND state_key=?",
-            (user_id, key)
-        ) as cur:
-            row = await cur.fetchone()
-    if row is None:
-        return None
     try:
-        return json.loads(row[0])
-    except Exception:
-        return row[0]
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT state_val FROM user_states WHERE user_id=? AND state_key=?",
+                (user_id, key)
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            logger.debug(f"[ustate] GET {user_id}/{key} → None")
+            return None
+        try:
+            val = json.loads(row[0])
+        except Exception:
+            val = row[0]
+        logger.debug(f"[ustate] GET {user_id}/{key} → {repr(val)}")
+        return val
+    except Exception as e:
+        logger.error(f"[ustate] GET ERROR {user_id}/{key}: {e}")
+        return None
 
 async def set_ustate(user_id: int, key: str, value) -> None:
     """Simpan pending state ke SQLite."""
+    logger.debug(f"[ustate] SET {user_id}/{key} = {repr(value)}")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """INSERT OR REPLACE INTO user_states (user_id, state_key, state_val, updated_at)
@@ -3770,6 +3781,24 @@ async def post_init(application) -> None:
     )
     logger.info("Price alert + wishlist + card cache syncer dijadwalkan.")
 
+async def debug_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT state_key, state_val FROM user_states WHERE user_id=?", (user_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+        if rows:
+            lines = [f"🗃️ *Debug State untuk user {user_id}:*"]
+            for k, v in rows:
+                lines.append(f"• `{k}` = `{v}`")
+            await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        else:
+            await update.message.reply_text(f"✅ Tidak ada state aktif untuk user {user_id}\\.", parse_mode="MarkdownV2")
+    except Exception as e:
+        await update.message.reply_text(f"❌ DB Error: `{str(e)}`", parse_mode="MarkdownV2")
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
@@ -3808,6 +3837,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setkomplit",    set_completion))
     app.add_handler(CommandHandler("jual",          jual_kartu))
     app.add_handler(CommandHandler("riwayatjual",   riwayat_jual))
+    app.add_handler(CommandHandler("debugstate",    debug_state))
     # Commands baru v4
     app.add_handler(CommandHandler("newsets",       new_sets_cmd))
     app.add_handler(CommandHandler("newcards",      new_cards_cmd))
