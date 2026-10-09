@@ -194,6 +194,18 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_snap_user ON portfolio_snapshots(user_id, snapped_at)"
         )
 
+        # ── Persistent user state (survive bot restart) ──────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_states (
+                user_id    INTEGER NOT NULL,
+                state_key  TEXT    NOT NULL,
+                state_val  TEXT    NOT NULL,
+                updated_at TEXT    DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, state_key)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ustate_user ON user_states(user_id)")
+
         await db.commit()
 
 # ── Helper: get user language ─────────────────────────────────────────────────
@@ -202,6 +214,105 @@ async def get_user_lang(user_id: int) -> str:
         async with db.execute("SELECT lang FROM user_settings WHERE user_id=?", (user_id,)) as cur:
             row = await cur.fetchone()
     return row[0] if row else "id"
+
+# ── Persistent user state helpers ────────────────────────────────────────────
+async def get_ustate(user_id: int, key: str):
+    """Ambil pending state dari SQLite. Return None kalau tidak ada."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT state_val FROM user_states WHERE user_id=? AND state_key=?",
+            (user_id, key)
+        ) as cur:
+            row = await cur.fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return row[0]
+
+async def set_ustate(user_id: int, key: str, value) -> None:
+    """Simpan pending state ke SQLite."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO user_states (user_id, state_key, state_val, updated_at)
+               VALUES (?, ?, ?, datetime('now'))""",
+            (user_id, key, json.dumps(value))
+        )
+        await db.commit()
+
+async def del_ustate(user_id: int, key: str) -> None:
+    """Hapus satu pending state."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM user_states WHERE user_id=? AND state_key=?",
+            (user_id, key)
+        )
+        await db.commit()
+
+async def pop_ustate(user_id: int, key: str, default=None):
+    """Ambil dan hapus pending state (atomic get-then-delete)."""
+    value = await get_ustate(user_id, key)
+    if value is not None:
+        await del_ustate(user_id, key)
+        return value
+    return default
+
+async def clear_ustate(user_id: int, keys: list) -> None:
+    """Hapus beberapa pending state sekaligus."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for key in keys:
+            await db.execute(
+                "DELETE FROM user_states WHERE user_id=? AND state_key=?",
+                (user_id, key)
+            )
+        await db.commit()
+
+# ── Parse harga Rupiah (support: 900000 / 900ribu / 900rb / 1jt / 1.5jt / 900k) ──
+def parse_rupiah(text: str) -> float:
+    """
+    Parse angka Rupiah dari berbagai format:
+      900000       → 900000.0
+      900.000      → 900000.0 (dot sebagai pemisah ribuan IDR)
+      900,000      → 900000.0
+      900ribu      → 900000.0
+      900rb / 900k → 900000.0
+      1jt / 1juta  → 1000000.0
+      1.5jt        → 1500000.0
+      Rp 900.000   → 900000.0
+    """
+    t = text.strip().lower()
+    t = re.sub(r'rp\.?\s*', '', t)   # hapus prefix Rp / Rp.
+
+    multiplier = 1.0
+    if re.search(r'juta|jt', t):
+        multiplier = 1_000_000.0
+        t = re.sub(r'juta|jt', '', t)
+    elif re.search(r'ribu|rb|k(?!\w)', t):
+        multiplier = 1_000.0
+        t = re.sub(r'ribu|rb|k(?!\w)', '', t)
+
+    # Normalise separators: jika ada titik DAN koma → titik = ribuan, koma = desimal
+    if '.' in t and ',' in t:
+        t = t.replace('.', '').replace(',', '.')
+    elif ',' in t:
+        # Cek apakah koma adalah pemisah ribuan (1,500) atau desimal (1,5)
+        parts = t.split(',')
+        if len(parts) == 2 and len(parts[1]) == 3:
+            t = t.replace(',', '')   # 1,500 → 1500
+        else:
+            t = t.replace(',', '.')  # 1,5 → 1.5
+    elif '.' in t:
+        parts = t.split('.')
+        # Jika ada lebih dari satu titik ATAU bagian setelah titik ada 3 digit → pemisah ribuan
+        if len(parts) > 2 or (len(parts) == 2 and len(parts[1]) == 3 and multiplier == 1.0):
+            t = t.replace('.', '')   # 900.000 → 900000 / 1.500.000 → 1500000
+        # else: 1.5 → biarkan sebagai desimal
+
+    t = re.sub(r'[^\d.]', '', t).strip()
+    if not t:
+        raise ValueError("Tidak ada angka yang bisa dibaca")
+    return float(t) * multiplier
 
 # ── Pokemon TCG API — helper: build headers ───────────────────────────────────
 def _tcg_headers() -> dict:
@@ -530,7 +641,7 @@ async def handle_snap_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     elif action == "snap_buy":
         # Simpan pending state → tunggu user kirim harga beli
-        context.bot_data[f"pending_buy_{user_id}"] = new_id
+        await set_ustate(user_id, "pending_buy", new_id)
         await query.message.reply_text(
             f"✅ *{esc(card['name'])}* disimpan\\! \\(ID: {new_id}\\)\n\n"
             f"💸 *Berapa harga beli kartu ini \\(USD\\)?*\n"
@@ -751,9 +862,9 @@ async def handle_manual_save(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query     = update.callback_query
     await query.answer()
     user_id   = update.effective_user.id
-    card_name = context.bot_data.pop(f"pending_manual_name_{user_id}", "Unknown Card")
-    context.bot_data.pop(f"pending_photo_name_{user_id}", None)
-    context.bot_data[f"pending_manual_price_{user_id}"] = card_name
+    card_name = await pop_ustate(user_id, "pending_manual_name") or "Unknown Card"
+    await del_ustate(user_id, "pending_photo_name")
+    await set_ustate(user_id, "pending_manual_price", card_name)
     await query.message.reply_text(
         f"💰 *Berapa harga kartu ini \\(Rupiah\\)?*\n"
         f"Kartu: *{esc(card_name)}*\n\n"
@@ -765,8 +876,8 @@ async def handle_manual_retry(update: Update, context: ContextTypes.DEFAULT_TYPE
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    context.bot_data.pop(f"pending_manual_name_{user_id}", None)
-    context.bot_data[f"pending_photo_name_{user_id}"] = True
+    await del_ustate(user_id, "pending_manual_name")
+    await set_ustate(user_id, "pending_photo_name", True)
     await query.message.reply_text(
         "📝 Ketik nama kartunya lagi bre:",
         parse_mode="MarkdownV2",
@@ -776,7 +887,7 @@ async def handle_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    data    = context.bot_data.pop(f"pending_manual_confirm_{user_id}", None)
+    data    = await pop_ustate(user_id, "pending_manual_confirm")
     if not data:
         await query.message.reply_text("⚠️ Data expired, coba ulangi bre\\.", parse_mode="MarkdownV2")
         return
@@ -805,11 +916,11 @@ async def handle_manual_editnama(update: Update, context: ContextTypes.DEFAULT_T
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    data    = context.bot_data.pop(f"pending_manual_confirm_{user_id}", None)
+    data    = await pop_ustate(user_id, "pending_manual_confirm")
     if not data:
         await query.message.reply_text("⚠️ Data expired, coba ulangi bre\\.", parse_mode="MarkdownV2")
         return
-    context.bot_data[f"pending_manual_edit_nama_{user_id}"] = data
+    await set_ustate(user_id, "pending_manual_edit_nama", data)
     await query.message.reply_text(
         f"✏️ Ketik nama kartu yang baru bre:\n_Nama sekarang: {esc(data['name'])}_",
         parse_mode="MarkdownV2",
@@ -819,11 +930,11 @@ async def handle_manual_editharga(update: Update, context: ContextTypes.DEFAULT_
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    data    = context.bot_data.pop(f"pending_manual_confirm_{user_id}", None)
+    data    = await pop_ustate(user_id, "pending_manual_confirm")
     if not data:
         await query.message.reply_text("⚠️ Data expired, coba ulangi bre\\.", parse_mode="MarkdownV2")
         return
-    context.bot_data[f"pending_manual_edit_harga_{user_id}"] = data["name"]
+    await set_ustate(user_id, "pending_manual_edit_harga", data["name"])
     await query.message.reply_text(
         f"💰 Ketik harga baru \\(Rupiah\\) bre:\n"
         f"_Harga sekarang: Rp {data['price_idr']:,.0f}_",
@@ -834,12 +945,12 @@ async def handle_manual_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    for key in [
-        f"pending_manual_confirm_{user_id}", f"pending_manual_price_{user_id}",
-        f"pending_manual_name_{user_id}",    f"pending_manual_edit_nama_{user_id}",
-        f"pending_manual_edit_harga_{user_id}", f"pending_photo_name_{user_id}",
-    ]:
-        context.bot_data.pop(key, None)
+    await clear_ustate(user_id, [
+        "pending_manual_confirm", "pending_manual_price",
+        "pending_manual_name",    "pending_manual_edit_nama",
+        "pending_manual_edit_harga", "pending_photo_name",
+        "pending_ocr_name",
+    ])
     await query.message.reply_text("❌ Dibatalkan\\.", parse_mode="MarkdownV2")
 
 # ── OCR: baca nama kartu dari foto label PSA ─────────────────────────────────
@@ -926,12 +1037,12 @@ async def handle_ocr_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    name    = context.bot_data.pop(f"pending_ocr_name_{user_id}", None)
+    name    = await pop_ustate(user_id, "pending_ocr_name")
     if not name:
         await query.message.reply_text("⚠️ Data expired, kirim foto lagi bre\\.", parse_mode="MarkdownV2")
         return
     # Langsung minta harga, tidak perlu cari API
-    context.bot_data[f"pending_manual_price_{user_id}"] = name  # simpan nama langsung
+    await set_ustate(user_id, "pending_manual_price", name)
     await query.message.reply_text(
         f"✅ Nama kartu: *{esc(name)}*\n\n"
         f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
@@ -942,8 +1053,8 @@ async def handle_ocr_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query   = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    context.bot_data.pop(f"pending_ocr_name_{user_id}", None)
-    context.bot_data[f"pending_photo_name_{user_id}"] = True
+    await del_ustate(user_id, "pending_ocr_name")
+    await set_ustate(user_id, "pending_photo_name", True)
     await query.message.reply_text(
         "📝 Ketik nama kartunya bre:",
         parse_mode="MarkdownV2",
@@ -967,7 +1078,7 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
             detected = None
 
         if detected:
-            context.bot_data[f"pending_ocr_name_{user_id}"] = detected
+            await set_ustate(user_id, "pending_ocr_name", detected)
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"✅ Pakai: {detected}", callback_data=f"ocr_use:{user_id}")],
                 [InlineKeyboardButton("✏️ Ketik nama sendiri",   callback_data=f"ocr_manual:{user_id}")],
@@ -978,7 +1089,7 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode="MarkdownV2",
             )
         else:
-            context.bot_data[f"pending_photo_name_{user_id}"] = True
+            await set_ustate(user_id, "pending_photo_name", True)
             await status.edit_text(
                 "📸 Foto diterima\\!\n\n"
                 "📝 *Ketik nama kartunya bre:*\n"
@@ -987,7 +1098,7 @@ async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     else:
         # Tesseract tidak terinstall → fallback manual
-        context.bot_data[f"pending_photo_name_{user_id}"] = True
+        await set_ustate(user_id, "pending_photo_name", True)
         await update.message.reply_text(
             "📸 Foto diterima\\!\n\n"
             "📝 *Ketik nama kartunya bre:*\n"
@@ -2386,24 +2497,25 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
     text    = update.message.text.strip()
 
     # ── Cek pending_manual_edit_nama ──────────────────────────────────────────
-    if f"pending_manual_edit_nama_{user_id}" in context.bot_data:
-        data         = context.bot_data.pop(f"pending_manual_edit_nama_{user_id}")
-        data["name"] = text
-        context.bot_data[f"pending_manual_confirm_{user_id}"] = data
-        await _show_manual_confirm(update.message, user_id, data)
+    _edit_nama = await pop_ustate(user_id, "pending_manual_edit_nama")
+    if _edit_nama is not None:
+        _edit_nama["name"] = text
+        await set_ustate(user_id, "pending_manual_confirm", _edit_nama)
+        await _show_manual_confirm(update.message, user_id, _edit_nama)
         return
 
     # ── Cek pending_manual_edit_harga ─────────────────────────────────────────
-    if f"pending_manual_edit_harga_{user_id}" in context.bot_data:
-        card_name = context.bot_data.pop(f"pending_manual_edit_harga_{user_id}")
+    card_name = await get_ustate(user_id, "pending_manual_edit_harga")
+    if card_name is not None:
+        await del_ustate(user_id, "pending_manual_edit_harga")
         try:
-            price_idr = float(re.sub(r'[^\d.]', '', text))
+            price_idr = parse_rupiah(text)
             price_usd = round(price_idr / EXCHANGE_RATE, 2)
             data      = {"name": card_name, "price_idr": price_idr, "price_usd": price_usd}
-            context.bot_data[f"pending_manual_confirm_{user_id}"] = data
+            await set_ustate(user_id, "pending_manual_confirm", data)
             await _show_manual_confirm(update.message, user_id, data)
         except (ValueError, ZeroDivisionError):
-            context.bot_data[f"pending_manual_edit_harga_{user_id}"] = card_name
+            await set_ustate(user_id, "pending_manual_edit_harga", card_name)
             await update.message.reply_text(
                 "⚠️ Masukkan angka Rupiah yang valid bre\\!\n_Contoh: `900000`_",
                 parse_mode="MarkdownV2",
@@ -2411,16 +2523,16 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # ── Cek pending_manual_price: user ketik harga IDR ──────────────────────────
-    card_name_pending = context.bot_data.get(f"pending_manual_price_{user_id}")
+    card_name_pending = await get_ustate(user_id, "pending_manual_price")
     if card_name_pending and isinstance(card_name_pending, str):
         try:
-            price_idr = float(re.sub(r'[^\d.]', '', text))
+            price_idr = parse_rupiah(text)
             if price_idr <= 0:
                 raise ValueError("harga nol")
             price_usd = round(price_idr / EXCHANGE_RATE, 2)
             data      = {"name": card_name_pending, "price_idr": price_idr, "price_usd": price_usd}
-            del context.bot_data[f"pending_manual_price_{user_id}"]
-            context.bot_data[f"pending_manual_confirm_{user_id}"] = data
+            await del_ustate(user_id, "pending_manual_price")
+            await set_ustate(user_id, "pending_manual_confirm", data)
             await _show_manual_confirm(update.message, user_id, data)
         except (ValueError, ZeroDivisionError):
             await update.message.reply_text(
@@ -2430,9 +2542,10 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # ── Cek pending_photo_name: user ketik nama manual setelah foto ──────────────
-    if context.bot_data.pop(f"pending_photo_name_{user_id}", False):
+    _photo_name_flag = await pop_ustate(user_id, "pending_photo_name")
+    if _photo_name_flag:
         # Langsung minta harga, tidak perlu cari API
-        context.bot_data[f"pending_manual_price_{user_id}"] = text  # simpan nama langsung
+        await set_ustate(user_id, "pending_manual_price", text)  # simpan nama langsung
         await update.message.reply_text(
             f"✅ Nama kartu: *{esc(text)}*\n\n"
             f"💰 Masukkan harga beli kamu \\(Rupiah\\)\\:\n_Contoh: `900000`_",
@@ -2441,7 +2554,7 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # ── Cek pending_buy: user balas harga modal setelah klik "Simpan + Set Modal" ──
-    pending_id = context.bot_data.get(f"pending_buy_{user_id}")
+    pending_id = await get_ustate(user_id, "pending_buy")
     if pending_id is not None:
         try:
             buy_usd = float(text.replace(",", "."))
@@ -2452,7 +2565,7 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
                 )
                 await db.commit()
             buy_idr = buy_usd * EXCHANGE_RATE
-            del context.bot_data[f"pending_buy_{user_id}"]
+            await del_ustate(user_id, "pending_buy")
             await update.message.reply_text(
                 f"✅ Modal disimpan\\!\n"
                 f"💵 *${buy_usd:.2f}* \\(Rp {buy_idr:,.0f}\\) untuk inventory ID *#{pending_id}*\\.\n"
