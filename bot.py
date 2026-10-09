@@ -99,6 +99,7 @@ async def init_db() -> None:
             ("condition",     "TEXT DEFAULT 'Near Mint'"),
             ("psa_grade",     "TEXT DEFAULT NULL"),
             ("buy_price_usd", "REAL DEFAULT 0.0"),
+            ("photo_file_id", "TEXT DEFAULT NULL"),
         ]:
             try:
                 await db.execute(f"ALTER TABLE inventory ADD COLUMN {col} {definition}")
@@ -907,13 +908,14 @@ async def handle_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     if not data:
         await query.message.reply_text("⚠️ Data expired, coba ulangi bre\\.", parse_mode="MarkdownV2")
         return
-    name      = data["name"]
-    price_idr = data["price_idr"]
-    price_usd = data["price_usd"]
+    name          = data["name"]
+    price_idr     = data["price_idr"]
+    price_usd     = data["price_usd"]
+    photo_file_id = await pop_ustate(user_id, "pending_photo_file_id")
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO inventory (user_id, card_name, price_usd, price_idr, condition) VALUES (?,?,?,?,?)",
-            (user_id, name, price_usd, price_idr, "Near Mint"),
+            "INSERT INTO inventory (user_id, card_name, price_usd, price_idr, condition, photo_file_id) VALUES (?,?,?,?,?,?)",
+            (user_id, name, price_usd, price_idr, "Near Mint", photo_file_id),
         )
         new_id = cur.lastrowid
         await db.execute(
@@ -921,12 +923,19 @@ async def handle_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             (user_id, name, price_usd, price_idr),
         )
         await db.commit()
-    await query.message.reply_text(
+    caption = (
         f"✅ *{esc(name)}* disimpan\\! \\(ID: \\#{new_id}\\)\n"
         f"💵 \\${esc(f'{price_usd:.2f}')} \\| Rp {esc(f'{price_idr:,.0f}')}\n\n"
-        f"_Set kondisi: /setcondition {new_id}_",
-        parse_mode="MarkdownV2",
+        f"_Set kondisi: /setcondition {new_id}_"
     )
+    if photo_file_id:
+        await query.message.reply_photo(
+            photo=photo_file_id,
+            caption=caption,
+            parse_mode="MarkdownV2",
+        )
+    else:
+        await query.message.reply_text(caption, parse_mode="MarkdownV2")
 
 async def handle_manual_editnama(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query   = update.callback_query
@@ -965,7 +974,7 @@ async def handle_manual_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
         "pending_manual_confirm", "pending_manual_price",
         "pending_manual_name",    "pending_manual_edit_nama",
         "pending_manual_edit_harga", "pending_photo_name",
-        "pending_ocr_name",
+        "pending_ocr_name",       "pending_photo_file_id",
     ])
     await query.message.reply_text("❌ Dibatalkan\\.", parse_mode="MarkdownV2")
 
@@ -1079,6 +1088,10 @@ async def handle_ocr_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ── Handler foto ─────────────────────────────────────────────────────────────
 async def handle_photo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+
+    # Simpan file_id foto terbesar (kualitas terbaik) untuk disimpan ke inventory nanti
+    if update.message.photo:
+        await set_ustate(user_id, "pending_photo_file_id", update.message.photo[-1].file_id)
 
     if HAS_TESSERACT:
         status = await update.message.reply_text(
@@ -1231,7 +1244,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade FROM inventory WHERE user_id=? ORDER BY id",
+            "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade, photo_file_id FROM inventory WHERE user_id=? ORDER BY id",
             (user_id,),
         ) as cur:
             items = await cur.fetchall()
@@ -1247,14 +1260,16 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     total_idr = sum(r[4] for r in items)
 
     lines = ["📦 *Portfolio Koleksi Pokémon:*\n"]
-    for idx, (_, name, card_set, p_usd, p_idr, condition, psa_grade) in enumerate(items, 1):
+    for idx, (inv_id, name, card_set, p_usd, p_idr, condition, psa_grade, photo_file_id) in enumerate(items, 1):
         usd_str   = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str   = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
         grade_str = f" \\| 🏆 PSA {esc(psa_grade)}" if psa_grade else ""
+        photo_str = f" 📷 _/photo {inv_id}_" if photo_file_id else ""
+        set_str = f" \\({esc(card_set)}\\)" if card_set else ""
         lines.append(
-            f"{idx}\\. *{esc(name)}* \\({esc(card_set)}\\)\n"
-            f"   ├ 🏷️ {cond_str}{grade_str}\n"
+            f"{idx}\\. *{esc(name)}*{set_str}\n"
+            f"   ├ 🏷️ {cond_str}{grade_str}{photo_str}\n"
             f"   └ 💵 {usd_str} \\| {idr_str}\n"
         )
 
@@ -1267,6 +1282,48 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+# ── /photo <id> — Kirim foto kartu dari inventory ─────────────────────────────
+async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "Format: `/photo \\<id\\>`\n_Contoh: `/photo 3`_\n\nID bisa dilihat di /inventory",
+            parse_mode="MarkdownV2",
+        )
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name, card_set, price_usd, photo_file_id FROM inventory WHERE id=? AND user_id=?",
+            (card_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
+        return
+    card_name, card_set, price_usd, photo_file_id = row
+    if not photo_file_id:
+        await update.message.reply_text(
+            f"📷 *{esc(card_name)}* belum punya foto tersimpan bre\\.\n"
+            f"_Foto disimpan otomatis saat kamu kirim foto kartu lalu simpan ke inventory\\._",
+            parse_mode="MarkdownV2",
+        )
+        return
+    caption = (
+        f"📷 *{esc(card_name)}*"
+        + (f" \\| {esc(card_set)}" if card_set else "")
+        + (f"\n💵 {esc_usd(price_usd)}" if price_usd and price_usd > 0 else "")
+    )
+    await update.message.reply_photo(
+        photo=photo_file_id,
+        caption=caption,
+        parse_mode="MarkdownV2",
+    )
 
 # ── /refresh ──────────────────────────────────────────────────────────────────
 async def refresh_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1394,9 +1451,10 @@ async def top10_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         medal   = medals[i] if i < len(medals) else f"{i+1}\\."
         usd_str = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
+        set_prefix = f"📦 {esc(card_set)} \\| " if card_set else ""
         lines.append(
             f"{medal} *{esc(name)}*\n"
-            f"   📦 {esc(card_set)} \\| 💵 {usd_str} \\| {idr_str}\n"
+            f"   {set_prefix}💵 {usd_str} \\| {idr_str}\n"
         )
 
     total_usd = sum(r[2] for r in items)
@@ -2190,8 +2248,9 @@ async def show_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         usd_str  = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str  = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         date_str = esc(added_at[:10]) if added_at else "\\-"
+        set_str2 = f" \\({esc(card_set)}\\)" if card_set else ""
         lines.append(
-            f"{idx}\\. *{esc(name)}* \\({esc(card_set)}\\)\n"
+            f"{idx}\\. *{esc(name)}*{set_str2}\n"
             f"   ├ 📅 {date_str}\n"
             f"   └ 💵 {usd_str} \\| {idr_str}\n"
         )
@@ -3877,6 +3936,7 @@ def main() -> None:
     app.add_handler(CommandHandler("portohistory", porto_history_cmd))
     app.add_handler(CommandHandler("saraanjual",   saran_jual_cmd))
     app.add_handler(CommandHandler("editprice",    edit_price_cmd))
+    app.add_handler(CommandHandler("photo",        show_card_photo))
 
     app.add_handler(CallbackQueryHandler(handle_snap_save,    pattern=r"^snap_(save|buy|wish):"))
     app.add_handler(CallbackQueryHandler(handle_card_select,  pattern=r"^card_select:"))
