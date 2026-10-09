@@ -75,6 +75,11 @@ CONDITION_MULTIPLIERS = {
 def esc(text: str) -> str:
     return re.sub(r'([_*\[\]()~`>#\+\-=|{}.!\\])', r'\\\1', str(text))
 
+def esc_usd(v: float) -> str:
+    """MarkdownV2-safe USD price string, e.g. esc_usd(5.5) → '\\$5\\.50'"""
+    return "\\$" + esc(f"{v:.2f}")
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -538,7 +543,7 @@ def _extract_card(card: dict) -> dict:
 # ── Format pesan kartu ────────────────────────────────────────────────────────
 def card_message(card: dict, label: str = "", show_save_hint: bool = False) -> str:
     suffix    = f" \\({label}\\)" if label else ""
-    price_usd = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "Tidak tersedia"
+    price_usd = esc_usd(card['price_usd']) if card["price_usd"] > 0 else "Tidak tersedia"
     price_idr = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "Tidak tersedia"
     hint = "\n💡 _Tekan tombol di bawah untuk simpan ke inventory_" if show_save_hint else \
            f"\n💡 _Mau simpan? Ketik: /add {esc(card['name'])}_"
@@ -638,7 +643,7 @@ async def handle_snap_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         await db.commit()
 
-    price_str = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+    price_str = esc_usd(card['price_usd']) if card["price_usd"] > 0 else "N/A"
     idr_str   = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "N/A"
 
     if action == "snap_save":
@@ -1207,7 +1212,7 @@ async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         await db.commit()
 
-    price_str = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "Tidak tersedia"
+    price_str = esc_usd(card['price_usd']) if card["price_usd"] > 0 else "Tidak tersedia"
     idr_str   = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "Tidak tersedia"
 
     await update.message.reply_text(
@@ -1243,7 +1248,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = ["📦 *Portfolio Koleksi Pokémon:*\n"]
     for idx, (_, name, card_set, p_usd, p_idr, condition, psa_grade) in enumerate(items, 1):
-        usd_str   = f"\\${p_usd:.2f}" if p_usd > 0 else "N/A"
+        usd_str   = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str   = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
         grade_str = f" \\| 🏆 PSA {esc(psa_grade)}" if psa_grade else ""
@@ -1255,7 +1260,7 @@ async def show_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines.append(
         f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-        f"💰 *Total: \\${total_usd:.2f} \\| Rp {total_idr:,.0f}*\n\n"
+        f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}*\n\n"
         f"⚙️ _/setcondition \\[no\\] \\[kondisi\\]_\n"
         f"🏆 _/setgrade \\[no\\] \\[grade\\]_\n"
         f"🗑️ _/delete \\[no\\]_ \\| 📥 _/export_"
@@ -1307,7 +1312,7 @@ async def refresh_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             updated += 1
             if abs(diff) > 0.01:
                 arrow = "📈" if diff > 0 else "📉"
-                changes.append(f"{arrow} *{esc(card_name)}*: \\${old_usd:.2f} → \\${new_usd:.2f}")
+                changes.append(f"{arrow} *{esc(card_name)}*: {esc_usd(old_usd)} → {esc_usd(new_usd)}")
 
         await asyncio.sleep(0.3)
 
@@ -1349,7 +1354,7 @@ async def compare_cards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             usd = card["price_usd"]
             prices_usd.append(usd)
-            price_usd = f"\\${usd:.2f}" if usd > 0 else "N/A"
+            price_usd = f"{esc_usd(usd)}" if usd > 0 else "N/A"
             price_idr = f"Rp {card['price_idr']:,.0f}" if usd > 0 else "N/A"
             lines.append(
                 f"🃏 *{esc(card['name'])}*\n"
@@ -1387,7 +1392,7 @@ async def top10_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     for i, (name, card_set, p_usd, p_idr, condition) in enumerate(items):
         medal   = medals[i] if i < len(medals) else f"{i+1}\\."
-        usd_str = f"\\${p_usd:.2f}" if p_usd > 0 else "N/A"
+        usd_str = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         lines.append(
             f"{medal} *{esc(name)}*\n"
@@ -1396,7 +1401,7 @@ async def top10_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     total_usd = sum(r[2] for r in items)
     lines.append("━━━━━━━━━━━━━━━━━━━━━━\n")
-    lines.append(f"💰 Total top {len(items)}: *\\${total_usd:.2f}*")
+    lines.append(f"💰 Total top {len(items)}: *{esc_usd(total_usd)}*")
 
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
@@ -1432,7 +1437,7 @@ async def price_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     for _, price_usd, price_idr, recorded_at in history:
         date_str = esc(recorded_at[:10]) if recorded_at else "\\-"
         time_str = esc(recorded_at[11:16]) if recorded_at and len(recorded_at) > 10 else ""
-        usd_str  = f"\\${price_usd:.2f}" if price_usd > 0 else "N/A"
+        usd_str  = f"{esc_usd(price_usd)}" if price_usd > 0 else "N/A"
         idr_str  = f"Rp {price_idr:,.0f}" if price_idr > 0 else "N/A"
         lines.append(f"📅 {date_str} {time_str}: *{usd_str}* \\| {idr_str}")
 
@@ -1441,9 +1446,9 @@ async def price_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         oldest = history[-1][1]
         diff   = latest - oldest
         if diff > 0:
-            trend = f"📈 Naik \\${diff:.2f} dari awal pencatatan"
+            trend = f"📈 Naik {esc_usd(diff)} dari awal pencatatan"
         elif diff < 0:
-            trend = f"📉 Turun \\${abs(diff):.2f} dari awal pencatatan"
+            trend = f"📉 Turun {esc_usd(abs(diff))} dari awal pencatatan"
         else:
             trend = "➡️ Harga stabil"
         lines.append(f"\n{trend}")
@@ -1493,9 +1498,9 @@ async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await db.commit()
 
     if alert_type == "turun":
-        desc = f"Notif kalau harga ≤ *\\${threshold:.2f}* 📉"
+        desc = f"Notif kalau harga ≤ *{esc_usd(threshold)}* 📉"
     else:
-        desc = f"Notif kalau harga ≥ *\\${threshold:.2f}* 📈"
+        desc = f"Notif kalau harga ≥ *{esc_usd(threshold)}* 📈"
 
     await update.message.reply_text(
         f"🔔 *Alert diset\\!*\n\n"
@@ -1527,7 +1532,7 @@ async def show_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines = [f"🔔 *Price Alerts Aktif \\({len(items)}\\):*\n"]
     for i, (_, name, threshold, alert_type, created_at) in enumerate(items, 1):
         date_str  = esc(created_at[:10]) if created_at else "\\-"
-        direction = f"≤ \\${threshold:.2f} 📉" if alert_type == "turun" else f"≥ \\${threshold:.2f} 📈"
+        direction = f"≤ {esc_usd(threshold)} 📉" if alert_type == "turun" else f"≥ {esc_usd(threshold)} 📈"
         lines.append(
             f"{i}\\. *{esc(name)}* {direction}\n"
             f"   📅 Set: {date_str}\n"
@@ -1601,8 +1606,8 @@ async def check_price_alerts(context) -> None:
                         text=(
                             f"🔔 *PRICE ALERT TRIGGERED\\!* {emoji}\n\n"
                             f"🃏 *{esc(card_name)}*\n"
-                            f"💵 Harga sekarang: *\\${current_price:.2f}* \\| Rp {idr:,.0f}\n"
-                            f"🎯 Target kamu: {direction} \\${threshold:.2f}\n\n"
+                            f"💵 Harga sekarang: *{esc_usd(current_price)}* \\| Rp {idr:,.0f}\n"
+                            f"🎯 Target kamu: {direction} {esc_usd(threshold)}\n\n"
                             f"💡 _{action_msg}_ 🚀\n"
                             f"_Alert ini otomatis dihapus\\._"
                         ),
@@ -1658,13 +1663,13 @@ async def scan_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         f"📦 *Set: {esc(actual_set)}*\n",
         f"🃏 Kartu terambil: *{len(cards)}* \\(total di set: {total_count}\\)\n",
-        f"💰 Total estimasi nilai: *\\${total_value:.2f}* \\| Rp {total_value * EXCHANGE_RATE:,.0f}\n",
-        f"📊 Rata\\-rata/kartu: *\\${avg_value:.2f}*\n",
+        f"💰 Total estimasi nilai: *{esc_usd(total_value)}* \\| Rp {total_value * EXCHANGE_RATE:,.0f}\n",
+        f"📊 Rata\\-rata/kartu: *{esc_usd(avg_value)}*\n",
         f"\n🏆 *Top 10 Paling Mahal:*\n"
     ]
 
     for i, card in enumerate(cards_with_price[:10], 1):
-        usd_str = f"\\${card['price_usd']:.2f}"
+        usd_str = esc_usd(card['price_usd'])
         idr_str = f"Rp {card['price_idr']:,.0f}"
         lines.append(f"{i}\\. *{esc(card['name'])}* — {usd_str} \\| {idr_str}")
 
@@ -1705,8 +1710,8 @@ async def portfolio_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for set_name, value in set_data:
             pct = (value / total * 100) if total > 0 else 0
             bar = "█" * int(pct / 5)
-            lines.append(f"*{esc(set_name or 'Unknown')}*\n`{bar}` {pct:.1f}% \\(\\${value:.2f}\\)\n")
-        lines.append(f"\n💰 *Total: \\${total:.2f}* \\| Rp {total * EXCHANGE_RATE:,.0f}")
+            lines.append(f"*{esc(set_name or 'Unknown')}*\n`{bar}` {esc(f"{pct:.1f}")}% \\({esc_usd(value)}\\)\n")
+        lines.append(f"\n💰 *Total: {esc_usd(total)}* \\| Rp {total * EXCHANGE_RATE:,.0f}")
         await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
         return
 
@@ -1765,7 +1770,7 @@ async def portfolio_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         photo=buf,
         caption=(
             f"📊 *Portfolio Chart*\n"
-            f"💰 Total: \\${total:.2f} \\| Rp {total_idr:,.0f}\n"
+            f"💰 Total: {esc_usd(total)} \\| Rp {total_idr:,.0f}\n"
             f"🃏 Dari {sum(1 for _ in set_data)} set berbeda"
         ),
         parse_mode="MarkdownV2"
@@ -1814,7 +1819,7 @@ async def find_cheap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     for i, card in enumerate(with_price[:8], 1):
         emoji   = "🟢" if i == 1 else "🟡" if i <= 3 else "🔴"
-        usd_str = f"\\${card['price_usd']:.2f}"
+        usd_str = esc_usd(card['price_usd'])
         idr_str = f"Rp {card['price_idr']:,.0f}"
         lines.append(
             f"{emoji} {i}\\. *{esc(card['name'])}*\n"
@@ -1824,7 +1829,7 @@ async def find_cheap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
     lines.append(f"━━━━━━━━━━━━━━━━━━━━━━\n")
-    lines.append(f"💡 Selisih termurah vs termahal: *\\${diff:.2f}*")
+    lines.append(f"💡 Selisih termurah vs termahal: *{esc_usd(diff)}*")
 
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
@@ -1856,7 +1861,7 @@ async def show_duplikat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
 
     for name, cnt, total_usd in dupes:
-        usd_str = f"\\${total_usd:.2f}" if total_usd > 0 else "N/A"
+        usd_str = f"{esc_usd(total_usd)}" if total_usd > 0 else "N/A"
         lines.append(
             f"📋 *{esc(name)}*\n"
             f"   🔢 Jumlah: {cnt}x \\| 💵 Total: {usd_str}\n"
@@ -1895,8 +1900,8 @@ async def nilai_kondisi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         total_adjusted += adjusted
 
         if price_usd > 0:
-            orig_str = f"\\${price_usd:.2f}"
-            adj_str  = f"\\${adjusted:.2f}"
+            orig_str = f"{esc_usd(price_usd)}"
+            adj_str  = f"{esc_usd(adjusted)}"
             pct      = int(multiplier * 100)
             cond_esc = esc(condition or "Near Mint")
             lines.append(
@@ -1905,13 +1910,13 @@ async def nilai_kondisi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
 
     diff     = total_adjusted - total_original
-    diff_str = f"\\-\\${abs(diff):.2f}" if diff < 0 else f"\\+\\${diff:.2f}"
+    diff_str = f"\\-{esc_usd(abs(diff))}" if diff < 0 else f"\\+{esc_usd(diff)}"
 
     lines.append(
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 *Ringkasan:*\n"
-        f"• Market value: \\${total_original:.2f}\n"
-        f"• Nilai real \\(kondisi\\): *\\${total_adjusted:.2f}* \\| Rp {total_adjusted * EXCHANGE_RATE:,.0f}\n"
+        f"• Market value: {esc_usd(total_original)}\n"
+        f"• Nilai real \\(kondisi\\): *{esc_usd(total_adjusted)}* \\| Rp {total_adjusted * EXCHANGE_RATE:,.0f}\n"
         f"• Selisih: {diff_str}\n\n"
         f"🏷️ *Multiplier:* Mint/NM 100% \\| LP 80% \\| MP 65% \\| HP 50% \\| D 25%"
     )
@@ -2036,7 +2041,7 @@ async def backup_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"⭐ Wishlist: *{len(wishlist)} kartu*\n"
             f"📊 History: *{len(history)} records*\n"
             f"🔔 Alerts: *{len(alerts)} aktif*\n\n"
-            f"💰 Nilai Portfolio: \\${total_usd:.2f} \\| Rp {total_idr:,.0f}\n\n"
+            f"💰 Nilai Portfolio: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}\n\n"
             f"📅 {esc(datetime.now().strftime('%d %b %Y %H:%M'))}"
         ),
         parse_mode="MarkdownV2"
@@ -2151,7 +2156,7 @@ async def add_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         await db.commit()
 
-    price_str = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+    price_str = esc_usd(card['price_usd']) if card["price_usd"] > 0 else "N/A"
     idr_str   = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "N/A"
     await update.message.reply_text(
         f"⭐ *{esc(card['name'])}* masuk wishlist\\!\n"
@@ -2182,7 +2187,7 @@ async def show_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     lines = ["⭐ *Wishlist Pokémon:*\n"]
     for idx, (_, name, card_set, p_usd, p_idr, added_at) in enumerate(items, 1):
-        usd_str  = f"\\${p_usd:.2f}" if p_usd > 0 else "N/A"
+        usd_str  = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         idr_str  = f"Rp {p_idr:,.0f}" if p_idr > 0 else "N/A"
         date_str = esc(added_at[:10]) if added_at else "\\-"
         lines.append(
@@ -2193,7 +2198,7 @@ async def show_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     lines.append(
         f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-        f"💰 *Total Estimasi: \\${total_usd:.2f} \\| Rp {total_idr:,.0f}*\n\n"
+        f"💰 *Total Estimasi: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}*\n\n"
         f"🗑️ _/removewish \\[no\\]_"
     )
 
@@ -2279,14 +2284,14 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🏆 Kartu Graded: *{graded_count}*\n"
         f"🔔 Alerts Aktif: *{alerts_count}*\n\n"
         f"💰 *Nilai Portfolio:*\n"
-        f"• Market value: \\${total_usd:.2f} \\| Rp {total_idr:,.0f}\n"
-        f"• Nilai real \\(kondisi\\): *\\${adjusted_total:.2f}*\n"
-        f"• Rata\\-rata: \\${avg_usd:.2f}/kartu\n\n"
+        f"• Market value: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}\n"
+        f"• Nilai real \\(kondisi\\): *{esc_usd(adjusted_total)}*\n"
+        f"• Rata\\-rata: {esc_usd(avg_usd)}/kartu\n\n"
         f"🥇 *Termahal:*\n"
-        f"  {esc(top_card[0])} \\— \\${top_card[2]:.2f}\n\n"
+        f"  {esc(top_card[0])} \\— {esc_usd(top_card[2])}\n\n"
     )
     if cheapest:
-        msg += f"💸 *Termurah:*\n  {esc(cheapest[0])} \\— \\${cheapest[2]:.2f}\n\n"
+        msg += f"💸 *Termurah:*\n  {esc(cheapest[0])} \\— {esc_usd(cheapest[2])}\n\n"
     msg += (
         f"🏷️ *Kondisi:*\n{cond_lines}\n\n"
         f"📈 _/history \\[nama\\]_ \\| 🏆 _/top10_ \\| 📊 _/portfoliochart_\n"
@@ -2360,7 +2365,7 @@ async def export_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         caption=(
             f"📥 *Inventory Export*\n"
             f"Total: *{len(items)} kartu*\n"
-            f"💵 ${total_usd:.2f} \\| 🇮🇩 Rp {total_idr:,.0f}"
+            f"💵 {esc_usd(total_usd)} \\| 🇮🇩 Rp {esc(f'{total_idr:,.0f}')}"
         ),
         parse_mode="MarkdownV2",
     )
@@ -2602,7 +2607,7 @@ async def handle_card_search_v4(update: Update, context: ContextTypes.DEFAULT_TY
             await del_ustate(user_id, "pending_buy")
             await update.message.reply_text(
                 f"✅ Modal disimpan\\!\n"
-                f"💵 *${buy_usd:.2f}* \\(Rp {buy_idr:,.0f}\\) untuk inventory ID *#{pending_id}*\\.\n"
+                f"💵 *{esc_usd(buy_usd)}* \\(Rp {esc(f'{buy_idr:,.0f}')}\\) untuk inventory ID *\\#{pending_id}*\\.\n"
                 f"_Gunakan /jual {pending_id} \\<harga\\> kalau mau jual nanti\\._",
                 parse_mode="MarkdownV2",
             )
@@ -2769,7 +2774,7 @@ async def new_cards_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         lines = [f"🏆 *Kartu Termahal dari {len(latest_sets)} Set Terbaru*\n"]
         for i, c in enumerate(top, 1):
-            p_str = f"\\${c['price_usd']:.2f}" if c["price_usd"] > 0 else "N/A"
+            p_str = esc_usd(c['price_usd']) if c["price_usd"] > 0 else "N/A"
             lines.append(
                 f"{i}\\. *{esc(c['name'])}*\n"
                 f"   📦 {esc(c['set'])} \\| ✨ {esc(c['rarity'])} \\| 💵 {p_str}\n"
@@ -2821,7 +2826,7 @@ async def gen_browse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if cached:
         lines = [f"🎮 *{esc(label)}*\n_Top 20 by harga \\(dari cache lokal\\)_\n"]
         for i, (name, card_set, p_usd) in enumerate(cached, 1):
-            p_str = f"\\${p_usd:.2f}"
+            p_str = f"{esc_usd(p_usd)}"
             lines.append(f"{i}\\. *{esc(name)}* — {esc(card_set or '-')} \\| {p_str}")
         lines.append(f"\n_Update cache: /synccards_")
         await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
@@ -2871,7 +2876,7 @@ async def gen_browse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         lines = [f"🎮 *{esc(label)}*\n_Top kartu \\(dari API\\)_\n"]
         for i, c in enumerate(extracted[:20], 1):
-            p_str = f"\\${c['price_usd']:.2f}" if c["price_usd"] > 0 else "N/A"
+            p_str = esc_usd(c['price_usd']) if c["price_usd"] > 0 else "N/A"
             lines.append(
                 f"{i}\\. *{esc(c['name'])}* — {esc(c['set'])} \\| {esc(c['rarity'])} \\| {p_str}"
             )
@@ -2919,7 +2924,7 @@ async def cari_lokal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     lines = [f"🔍 *Hasil Cache: '{esc(query)}' \\({len(rows)} kartu\\)*\n"]
     for name, card_set, series, p_usd in rows:
-        p_str = f"\\${p_usd:.2f}" if p_usd > 0 else "N/A"
+        p_str = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
         lines.append(f"• *{esc(name)}* — {esc(card_set or '?')} \\| {esc(series or '?')} \\| {p_str}")
     lines.append("\n_Ketik nama kartu langsung untuk cek harga real\\-time_")
 
@@ -2970,14 +2975,14 @@ async def set_buyprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     profit     = market_usd - buy_price
     pct        = ((market_usd - buy_price) / buy_price * 100) if buy_price > 0 else 0
     emoji      = "📈" if profit >= 0 else "📉"
-    profit_str = f"\\+\\${profit:.2f}" if profit >= 0 else f"\\-\\${abs(profit):.2f}"
+    profit_str = f"\\+{esc_usd(profit)}" if profit >= 0 else f"\\-{esc_usd(abs(profit))}"
 
     await update.message.reply_text(
         f"✅ *Harga beli disimpan\\!*\n\n"
         f"🃏 *{esc(card_name)}* \\({esc(card_set or '-')}\\)\n"
-        f"💸 Harga Beli : \\${buy_price:.2f}\n"
-        f"💵 Market    : \\${market_usd:.2f}\n"
-        f"{emoji} Profit    : {profit_str} \\({esc(f'{pct:.1f}')}%\\)",
+        f"💸 Harga Beli : {esc_usd(buy_price)}\n"
+        f"💵 Market    : {esc_usd(market_usd)}\n"
+        f"{emoji} Profit    : {profit_str} \\({esc(f'{esc(f"{pct:.1f}")}')}%\\)",
         parse_mode="MarkdownV2",
     )
 
@@ -3023,10 +3028,10 @@ async def show_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         profit      = adj_market - buy_usd
         pct         = (profit / buy_usd * 100) if buy_usd > 0 else 0
         em          = "📈" if profit >= 0 else "📉"
-        p_str       = f"\\+{profit:.2f}" if profit >= 0 else f"\\-{abs(profit):.2f}"
+        p_str       = f"\\+{esc(f"{profit:.2f}")}" if profit >= 0 else f"\\-{abs(profit):.2f}"
         lines.append(
             f"{em} *{esc(name[:25])}*\n"
-            f"   Beli \\${buy_usd:.2f} → Market \\${adj_market:.2f} \\| {esc(f'{pct:.1f}')}%  \\(\\${p_str}\\)\n"
+            f"   Beli {esc_usd(buy_usd)} → Market {esc_usd(adj_market)} \\| {esc(f'{esc(f"{pct:.1f}")}')}%  \\(\\${p_str}\\)\n"
         )
 
     if len(tagged) > 15:
@@ -3034,9 +3039,9 @@ async def show_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines.append(
         f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-        f"{emoji_total} *Total Modal  : \\${total_buy:.2f}*\n"
-        f"{emoji_total} *Nilai Pasar  : \\${total_market:.2f}*\n"
-        f"{emoji_total} *Profit/Loss  : \\${total_profit:+.2f} \\({total_pct:+.1f}%\\)*"
+        f"{emoji_total} *Total Modal  : {esc_usd(total_buy)}*\n"
+        f"{emoji_total} *Nilai Pasar  : {esc_usd(total_market)}*\n"
+        f"{emoji_total} *Profit/Loss  : {esc(f"{total_profit:+.2f}")} \\({total_pct:+.1f}%\\)*"
     )
     if untagged:
         lines.append(f"\n_\\({len(untagged)} kartu belum ada harga beli — pakai /buyprice\\)_")
@@ -3084,7 +3089,7 @@ async def price_trend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not HAS_MATPLOTLIB:
         lines = [f"📈 *Tren Harga: {esc(rows[0][0])}*\n"]
         for name, price, ts in rows:
-            lines.append(f"• {esc(ts[:10])} — \\${price:.2f}")
+            lines.append(f"• {esc(ts[:10])} — {esc_usd(price)}")
         await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
         return
 
@@ -3191,7 +3196,7 @@ async def set_completion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     lines = [
         f"🏆 *{esc(set_name)}*\n",
-        f"📊 Kelengkapan: *{esc(f'{pct:.1f}')}%* \\[{esc(bar)}\\]\n",
+        f"📊 Kelengkapan: *{esc(f'{esc(f"{pct:.1f}")}')}%* \\[{esc(bar)}\\]\n",
         f"✅ Dimiliki   : *{len(have)}/{total_in_set}* kartu\n",
         f"❌ Belum punya: *{len(missing)}* kartu\n",
     ]
@@ -3199,14 +3204,14 @@ async def set_completion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if missing_cost > 0:
         lines.append(
             f"💸 Estimasi beli semua yang kurang:\n"
-            f"   \\${missing_cost:.2f} \\| Rp {missing_idr:,.0f}\n"
+            f"   {esc_usd(missing_cost)} \\| Rp {missing_idr:,.0f}\n"
         )
 
     if missing:
         lines.append(f"\n❌ *Belum punya \\({min(len(missing), 15)} ditampilkan\\):*")
         for c in missing[:15]:
             p = c.get("price_usd", 0)
-            p_str = f" — \\${p:.2f}" if p > 0 else ""
+            p_str = f" — {esc_usd(p)}" if p > 0 else ""
             lines.append(f"• {esc(c.get('name','?'))}{p_str}")
         if len(missing) > 15:
             lines.append(f"_\\.\\.\\. dan {len(missing)-15} kartu lagi_")
@@ -3261,14 +3266,14 @@ async def jual_kartu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await db.commit()
 
     em     = "📈" if profit >= 0 else "📉"
-    p_str  = f"\\+\\${profit:.2f}" if profit >= 0 else f"\\-\\${abs(profit):.2f}"
-    buy_str = f"\\${buy_price:.2f}" if buy_price and buy_price > 0 else "N/A"
+    p_str  = f"\\+{esc_usd(profit)}" if profit >= 0 else f"\\-{esc_usd(abs(profit))}"
+    buy_str = f"{esc_usd(buy_price)}" if buy_price and buy_price > 0 else "N/A"
 
     await update.message.reply_text(
         f"💰 *Kartu Terjual\\!*\n\n"
         f"🃏 *{esc(card_name)}* \\({esc(card_set or '-')}\\)\n"
         f"💸 Harga Beli : {buy_str}\n"
-        f"💵 Harga Jual : \\${sell_price:.2f} \\| Rp {sell_idr:,.0f}\n"
+        f"💵 Harga Jual : {esc_usd(sell_price)} \\| Rp {sell_idr:,.0f}\n"
         f"{em} Profit      : {p_str}\n\n"
         f"_Kartu dihapus dari inventory\\. Lihat riwayat di /riwayatjual_",
         parse_mode="MarkdownV2",
@@ -3302,18 +3307,18 @@ async def riwayat_jual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     for name, card_set, sell_usd, sell_idr, buy_usd, profit, sold_at in rows:
         em    = "📈" if profit >= 0 else "📉"
-        p_str = f"\\+\\${profit:.2f}" if profit >= 0 else f"\\-\\${abs(profit):.2f}"
+        p_str = f"\\+{esc_usd(profit)}" if profit >= 0 else f"\\-{esc_usd(abs(profit))}"
         date  = esc(sold_at[:10]) if sold_at else "\\-"
-        buy_s = f"\\${buy_usd:.2f}" if buy_usd and buy_usd > 0 else "N/A"
+        buy_s = f"{esc_usd(buy_usd)}" if buy_usd and buy_usd > 0 else "N/A"
         lines.append(
             f"{em} *{esc(name[:22])}*\n"
-            f"   📅 {date} \\| Beli {buy_s} → Jual \\${sell_usd:.2f} \\| {p_str}\n"
+            f"   📅 {date} \\| Beli {buy_s} → Jual {esc_usd(sell_usd)} \\| {p_str}\n"
         )
 
     lines.append(
         f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-        f"{em_total} *Total Revenue : \\${total_revenue:.2f}*\n"
-        f"{em_total} *Total Profit  : \\${total_profit:+.2f}*"
+        f"{em_total} *Total Revenue : {esc_usd(total_revenue)}*\n"
+        f"{em_total} *Total Profit  : {esc(f"{total_profit:+.2f}")}*"
     )
 
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
@@ -3359,7 +3364,7 @@ async def add_wishlist_v3(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 (user_id, card_query, "Unknown", 0.0, 0.0, target_price),
             )
             await db.commit()
-            target_str = f" \\| 🎯 Target: \\${target_price:.2f}" if target_price > 0 else ""
+            target_str = f" \\| 🎯 Target: {esc_usd(target_price)}" if target_price > 0 else ""
             await update.message.reply_text(
                 f"⭐ *{esc(card_query)}* ditambahkan ke wishlist{target_str} \\(harga belum tersedia\\)\\.",
                 parse_mode="MarkdownV2",
@@ -3372,9 +3377,9 @@ async def add_wishlist_v3(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         await db.commit()
 
-    price_str  = f"\\${card['price_usd']:.2f}" if card["price_usd"] > 0 else "N/A"
+    price_str  = esc_usd(card['price_usd']) if card["price_usd"] > 0 else "N/A"
     idr_str    = f"Rp {card['price_idr']:,.0f}" if card["price_idr"] > 0 else "N/A"
-    target_str = f"\n🎯 Target alert: \\${target_price:.2f}" if target_price > 0 else ""
+    target_str = f"\n🎯 Target alert: {esc_usd(target_price)}" if target_price > 0 else ""
 
     # Cek apakah harga sudah di bawah target
     hint = ""
@@ -3417,7 +3422,7 @@ async def check_wishlist_targets(context) -> None:
                         text=(
                             f"🔔 *Wishlist Alert\\!*\n\n"
                             f"⭐ *{esc(card_name)}*\n"
-                            f"Harga sekarang \\${current_usd:.2f} sudah ≤ target \\${target_usd:.2f}\\!\n"
+                            f"Harga sekarang {esc_usd(current_usd)} sudah ≤ target {esc_usd(target_usd)}\\!\n"
                             f"_Saatnya beli\\!_ 🛒"
                         ),
                         parse_mode="MarkdownV2",
@@ -3474,15 +3479,15 @@ async def edit_price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await db.commit()
 
     diff      = new_price - (old_price or 0)
-    diff_sign = f"\\+${diff:.2f}" if diff >= 0 else f"\\-${abs(diff):.2f}"
+    diff_sign = f"\\+{esc_usd(diff)}" if diff >= 0 else f"\\-{esc_usd(abs(diff))}"
     diff_tag  = f"📈 {diff_sign}" if diff > 0 else (f"📉 {diff_sign}" if diff < 0 else "➡️ Sama")
 
     await update.message.reply_text(
         f"✅ *Harga diupdate\\!*\n\n"
         f"🃏 *{esc(card_name)}* _{esc(card_set or '')}_\n"
         f"ID: \\#{inv_id}\n\n"
-        f"Harga lama: \\${old_price:.2f}\n"
-        f"Harga baru: *\\${new_price:.2f}* \\(Rp {new_idr:,.0f}\\)\n"
+        f"Harga lama: {esc_usd(old_price)}\n"
+        f"Harga baru: *{esc_usd(new_price)}* \\(Rp {new_idr:,.0f}\\)\n"
         f"Selisih: {diff_tag}",
         parse_mode="MarkdownV2",
     )
@@ -3554,7 +3559,7 @@ async def harga_lokal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         price_usd = price_val / EXCHANGE_RATE
         lines.append(
             f"• *{esc(name[:40])}*\n"
-            f"  Rp {price_val:,} \\(≈\\${price_usd:.2f}\\) — _{esc(shop)}_"
+            f"  Rp {price_val:,} \\(≈{esc_usd(price_usd)}\\) — _{esc(shop)}_"
         )
         shown += 1
     if shown == 0:
@@ -3618,7 +3623,7 @@ async def porto_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not HAS_MATPLOTLIB:
         lines = [f"📅 *Riwayat Nilai Portfolio*\n"]
         for date, usd, cnt in rows[-10:]:
-            lines.append(f"• `{date}` — \\${usd:.2f} \\({cnt} kartu\\)")
+            lines.append(f"• `{date}` — {esc_usd(usd)} \\({cnt} kartu\\)")
         await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
         return
 
@@ -3773,8 +3778,8 @@ async def saran_jual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                   f"ROI *{c['roi']:.0f}%* ⚠️" if c["roi"] else "ROI _belum diset_")
         lines.append(
             f"*{i}\\. {esc(c['name'])}* _\\({esc(c['set'])}\\)_\n"
-            f"   💵 \\${c['price']:.2f} \\(Rp {price_idr:,.0f}\\) — {roi_tag}\n"
-            f"   Kondisi: {esc(c['condition'])} \\| ID: #{c['id']}"
+            f"   💵 {esc_usd(c['price'])} \\(Rp {esc(f'{price_idr:,.0f}')}\\) — {roi_tag}\n"
+            f"   Kondisi: {esc(c['condition'])} \\| ID: \\#{c['id']}"
         )
     lines.append("\n_Gunakan /jual \\<id\\> \\<harga\\> untuk catat penjualan\\._")
     await update.message.reply_text("\n\n".join(lines), parse_mode="MarkdownV2")
