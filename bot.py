@@ -862,7 +862,7 @@ async def _show_manual_confirm(message, user_id: int, data: dict) -> None:
     await message.reply_text(
         f"📋 *Konfirmasi Simpan*\n\n"
         f"🃏 Nama: *{esc(name)}*\n"
-        f"💵 Harga: Rp {price_idr:,.0f} \\(\\${price_usd:.2f}\\)\n\n"
+        f"💵 Harga: Rp {esc(f'{price_idr:,.0f}')} \\(\\${esc(f'{price_usd:.2f}')}\\)\n\n"
         "_Sudah benar?_",
         reply_markup=keyboard,
         parse_mode="MarkdownV2",
@@ -918,7 +918,7 @@ async def handle_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         await db.commit()
     await query.message.reply_text(
         f"✅ *{esc(name)}* disimpan\\! \\(ID: \\#{new_id}\\)\n"
-        f"💵 \\${price_usd:.2f} \\| Rp {price_idr:,.0f}\n\n"
+        f"💵 \\${esc(f'{price_usd:.2f}')} \\| Rp {esc(f'{price_idr:,.0f}')}\n\n"
         f"_Set kondisi: /setcondition {new_id}_",
         parse_mode="MarkdownV2",
     )
