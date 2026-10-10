@@ -1493,7 +1493,7 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
     start       = page * INV_PAGE_SIZE
     page_items  = items[start:start + INV_PAGE_SIZE]
 
-    header = f"📦 *Portfolio Koleksi Pokémon* \\(hal {page + 1}/{total_pages}\\):\n"
+    header = f"🎴 *POKÉDEX KOLEKSI* — Hal {page + 1}/{total_pages}\n\n"
     lines  = [header]
 
     for global_idx, (inv_id, name, card_set, p_usd, p_idr,
@@ -1502,32 +1502,28 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
         usd_str   = esc_usd(p_usd)   if (p_usd  or 0) > 0 else "N/A"
         idr_str   = f"Rp {p_idr:,.0f}" if (p_idr or 0) > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
-        grade_str = f" \\| 🏆 {esc(str(psa_grade))}" if psa_grade else ""
-        photo_str = f" \\| 📷 /photo {global_idx}" if photo_file_id else ""
-        set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
-        sale_str  = f" \\| 🏷️ _{esc_usd(ask_price or 0)}_" if for_sale else ""
-
-        mid_rows  = f"   ├ {cond_str}{grade_str}{photo_str}\n"
-        if tags:
-            mid_rows += f"   ├ 🔖 _{esc(tags)}_\n"
-        if notes:
-            mid_rows += f"   ├ 📝 _{esc(notes)}_\n"
+        grade_str = f"🏆 PSA {esc(str(psa_grade))} · " if psa_grade else ""
+        photo_str = f" · 📷 /photo {global_idx}" if photo_file_id else ""
+        set_line  = f"   _{esc(card_set)}_\n" if card_set else ""
+        sale_str  = f"\n   🏷️ Ask: _{esc_usd(ask_price or 0)}_" if for_sale else ""
+        tag_str   = f"\n   🔖 _{esc(tags)}_" if tags else ""
+        note_str  = f"\n   📝 _{esc(notes)}_" if notes else ""
 
         lines.append(
-            f"{global_idx}\\. *{esc(name)}*{set_str} — `\\#{global_idx}`\n"
-            f"{mid_rows}"
-            f"   └ 💵 {usd_str} \\| {idr_str}{sale_str}\n"
+            f"◆ `\\#{global_idx}` *{esc(name)}*\n"
+            f"{set_line}"
+            f"   {grade_str}{cond_str}{photo_str}{sale_str}{tag_str}{note_str}\n"
+            f"   💵 {usd_str} · {idr_str}\n\n"
         )
 
     # Footer hanya di halaman terakhir
     if page == total_pages - 1:
         lines.append(
-            f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
-            f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}* \\({total} kartu\\)\n\n"
-            f"_/note \\[id\\] • /forsale \\[id\\] \\[harga\\] • /setgrade \\[id\\]_\n"
-            f"_/setcondition • /tag • /remind • /share • /setphoto_\n"
-            f"_/marketplace \\[id\\] • /hargashopee \\[id\\] • /bulkadd_\n"
-            f"_/tradeoffer • /setlengkap \\[nama set\\] • /gradedalert_"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 *{esc_usd(total_usd)} · Rp {total_idr:,.0f}* \\({total} kartu\\)\n\n"
+            f"_/note · /forsale · /tag · /remind · /share_\n"
+            f"_/setphoto · /setgrade · /setcondition · /editkartu_\n"
+            f"_/marketplace · /hargashopee · /bulkadd · /gradedalert_"
         )
 
     return "\n".join(lines), page, total_pages, total
