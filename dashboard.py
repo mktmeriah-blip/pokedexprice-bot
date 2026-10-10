@@ -1,891 +1,1575 @@
-#!/usr/bin/env python3
 """
-PokeDex Price — Web Dashboard
-==============================
-Jalankan di Termux (sesi terpisah dari bot):
-  pip install flask
-  python3 dashboard.py
-
-Buka di browser HP: http://localhost:5000
-Akses dari HP lain : http://<IP-lokal>:5000
+Pokédex Price Dashboard — Flask web app
+Reads from pokemon_inventory.db (same DB as bot.py)
+Run:  python dashboard.py
+Then: cloudflared tunnel --url http://localhost:5000
 """
 
+import json
 import os
-import glob
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
+
 from flask import Flask, jsonify, render_template_string, request
 
-# ─── Auto-detect DB ───────────────────────────────────────────────────────────
-def _find_db() -> str:
-    # 1. Env var override
-    if os.getenv("DB_PATH"):
-        return os.getenv("DB_PATH")
-    # 2. Folder yang sama dengan dashboard.py — cek semua nama DB yang mungkin
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ("pokemon_inventory.db", "pokedex.db", "inventory.db"):
-        p = os.path.join(script_dir, name)
-        if os.path.exists(p):
-            return p
-    # 3. Lokasi umum Termux / home
-    home = os.path.expanduser("~")
-    bot_dirs = ["", "bot", "pokedexprice-bot", "pokedex-bot", "PokeDexPrice",
-                "pokedexeprice-bot", "pokemon-bot"]
-    db_names = ["pokemon_inventory.db", "pokedex.db", "inventory.db"]
-    for d in bot_dirs:
-        for n in db_names:
-            p = os.path.join(home, d, n) if d else os.path.join(home, n)
-            if os.path.exists(p):
-                return p
-    # 4. Cari di seluruh home (semua nama DB)
-    for name in db_names:
-        found = glob.glob(os.path.join(home, "**", name), recursive=True)
-        if found:
-            found.sort(key=os.path.getmtime, reverse=True)
-            return found[0]
-    # Fallback
-    return os.path.join(script_dir, "pokemon_inventory.db")
+# ── Config ────────────────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
+except ImportError:
+    pass
 
-DB_PATH = _find_db()
-RATE    = int(os.getenv("EXCHANGE_RATE", "16000"))
-PORT    = int(os.getenv("DASHBOARD_PORT", "5000"))
+DB_PATH      = os.getenv("DB_PATH", "pokemon_inventory.db")
+EXCHANGE_RATE = int(os.getenv("EXCHANGE_RATE", 16000))
+PORT          = int(os.getenv("DASHBOARD_PORT", 5000))
 
 app = Flask(__name__)
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ── DB helpers ────────────────────────────────────────────────────────────────
+def get_db():
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    return db
 
-# ─── API: Users ───────────────────────────────────────────────────────────────
-@app.route("/api/users")
-def api_users():
-    with db() as conn:
-        rows = conn.execute("""
-            SELECT DISTINCT user_id, COUNT(*) as cards
-            FROM inventory GROUP BY user_id ORDER BY cards DESC
-        """).fetchall()
-    return jsonify([dict(r) for r in rows])
 
-# ─── API: Stats ───────────────────────────────────────────────────────────────
-@app.route("/api/stats")
-def api_stats():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE user_id=?" if uid else ""
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        inv = conn.execute(f"""
-            SELECT COUNT(*) as cnt,
-                   COALESCE(SUM(price_usd),0)     as total_usd,
-                   COALESCE(SUM(buy_price_usd),0) as total_buy,
-                   COALESCE(SUM(CASE WHEN for_sale=1 THEN 1 ELSE 0 END),0) as fs_cnt,
-                   COALESCE(SUM(CASE WHEN for_sale=1 THEN ask_price_usd ELSE 0 END),0) as fs_ask
-            FROM inventory {w}
-        """, p).fetchone()
-        wish = conn.execute(f"SELECT COUNT(*) as cnt FROM wishlist {w}", p).fetchone()
-        sets = conn.execute(f"""
-            SELECT COUNT(DISTINCT COALESCE(card_set,'(Tanpa Set)')) as cnt
-            FROM inventory {w}
-        """, p).fetchone()
-        psa = conn.execute(f"""
-            SELECT COUNT(*) as cnt FROM inventory {w}
-            {"AND" if uid else "WHERE"} psa_grade IS NOT NULL AND psa_grade != ''
-        """, p).fetchone()
+def q(sql, params=()):
+    with get_db() as db:
+        cur = db.execute(sql, params)
+        return cur.fetchall()
 
-    total_usd = inv["total_usd"] or 0
-    total_buy = inv["total_buy"] or 0
-    roi = ((total_usd - total_buy) / total_buy * 100) if total_buy > 0 else 0
 
-    return jsonify({
-        "cards":      inv["cnt"],
-        "total_usd":  total_usd,
-        "total_idr":  total_usd * RATE,
-        "total_buy":  total_buy,
-        "roi":        round(roi, 2),
-        "profit_usd": total_usd - total_buy,
-        "fs_cnt":     inv["fs_cnt"],
-        "fs_ask":     inv["fs_ask"],
-        "wishlist":   wish["cnt"],
-        "sets":       sets["cnt"],
-        "psa_graded": psa["cnt"],
-    })
+def q1(sql, params=()):
+    with get_db() as db:
+        cur = db.execute(sql, params)
+        row = cur.fetchone()
+        return row
 
-# ─── API: Portfolio History ───────────────────────────────────────────────────
-@app.route("/api/portfolio_history")
-def api_portfolio_history():
-    uid  = request.args.get("uid", type=int)
-    days = request.args.get("days", 30, type=int)
-    w    = "WHERE user_id=?" if uid else ""
-    p    = (uid,) if uid else ()
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT DATE(snapshot_at) as date,
-                   COALESCE(SUM(total_usd), 0) as total_usd
-            FROM portfolio_snapshots {w}
-            {"AND" if uid else "WHERE"} snapshot_at >= ?
-            GROUP BY DATE(snapshot_at) ORDER BY date
-        """, p + (cutoff,)).fetchall()
-    return jsonify([{"date": r["date"], "value": round(r["total_usd"], 2)} for r in rows])
-
-# ─── API: By Set ──────────────────────────────────────────────────────────────
-@app.route("/api/by_set")
-def api_by_set():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE user_id=?" if uid else ""
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT COALESCE(card_set,'(Tanpa Set)') as set_name,
-                   COUNT(*) as cnt,
-                   COALESCE(SUM(price_usd), 0) as total_usd
-            FROM inventory {w}
-            GROUP BY set_name ORDER BY total_usd DESC LIMIT 10
-        """, p).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-# ─── API: By Condition ────────────────────────────────────────────────────────
-@app.route("/api/by_condition")
-def api_by_condition():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE user_id=?" if uid else ""
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT COALESCE(condition,'Unknown') as cond,
-                   COUNT(*) as cnt,
-                   COALESCE(SUM(price_usd), 0) as total_usd
-            FROM inventory {w}
-            GROUP BY cond ORDER BY total_usd DESC
-        """, p).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-# ─── API: Top Cards ───────────────────────────────────────────────────────────
-@app.route("/api/top_cards")
-def api_top_cards():
-    uid   = request.args.get("uid", type=int)
-    limit = request.args.get("limit", 10, type=int)
-    w     = "WHERE user_id=?" if uid else ""
-    p     = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT id, card_name, card_set, price_usd, buy_price_usd,
-                   condition, psa_grade, for_sale, ask_price_usd, tags
-            FROM inventory {w}
-            ORDER BY price_usd DESC LIMIT ?
-        """, p + (limit,)).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-# ─── API: Cards (paginated, searchable) ───────────────────────────────────────
-@app.route("/api/cards")
-def api_cards():
-    uid       = request.args.get("uid", type=int)
-    q         = request.args.get("q", "")
-    set_f     = request.args.get("set", "")
-    page      = request.args.get("page", 1, type=int)
-    per_page  = 20
-
-    conditions, params = [], []
-    if uid:   conditions.append("user_id=?");          params.append(uid)
-    if q:     conditions.append("card_name LIKE ?");   params.append(f"%{q}%")
-    if set_f: conditions.append("card_set=?");         params.append(set_f)
-    where  = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    offset = (page - 1) * per_page
-
-    with db() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM inventory {where}", params).fetchone()[0]
-        rows  = conn.execute(f"""
-            SELECT id, card_name, card_set, price_usd, buy_price_usd,
-                   condition, psa_grade, for_sale, ask_price_usd, notes, tags
-            FROM inventory {where}
-            ORDER BY price_usd DESC LIMIT ? OFFSET ?
-        """, params + [per_page, offset]).fetchall()
-
-    return jsonify({
-        "total": total,
-        "page":  page,
-        "pages": max(1, (total + per_page - 1) // per_page),
-        "cards": [dict(r) for r in rows],
-    })
-
-# ─── API: Sets List ───────────────────────────────────────────────────────────
-@app.route("/api/sets_list")
-def api_sets_list():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE user_id=?" if uid else ""
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT DISTINCT COALESCE(card_set,'(Tanpa Set)') as name
-            FROM inventory {w} ORDER BY name
-        """, p).fetchall()
-    return jsonify([r["name"] for r in rows])
-
-# ─── API: For Sale ────────────────────────────────────────────────────────────
-@app.route("/api/for_sale")
-def api_for_sale():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE for_sale=1" + (" AND user_id=?" if uid else "")
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT id, card_name, card_set, ask_price_usd, buy_price_usd,
-                   price_usd, condition, psa_grade, notes
-            FROM inventory {w}
-            ORDER BY ask_price_usd DESC
-        """, p).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-# ─── API: Recent Trades ───────────────────────────────────────────────────────
-@app.route("/api/recent_trades")
-def api_recent_trades():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE user_id=?" if uid else ""
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT card_name, sell_price_usd, buy_price_usd,
-                   (sell_price_usd - buy_price_usd) as profit,
-                   sold_at
-            FROM trade_log {w}
-            ORDER BY sold_at DESC LIMIT 20
-        """, p).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-# ─── API: Wishlist ────────────────────────────────────────────────────────────
-@app.route("/api/wishlist")
-def api_wishlist():
-    uid = request.args.get("uid", type=int)
-    w   = "WHERE user_id=?" if uid else ""
-    p   = (uid,) if uid else ()
-    with db() as conn:
-        rows = conn.execute(f"""
-            SELECT id, card_name, card_set, target_price_usd, priority, notes, added_at
-            FROM wishlist {w}
-            ORDER BY priority DESC, target_price_usd DESC LIMIT 50
-        """, p).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-# ─── Frontend HTML ────────────────────────────────────────────────────────────
-@app.route("/")
-def index():
-    return render_template_string(DASHBOARD_HTML)
-
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+# ── Template ──────────────────────────────────────────────────────────────────
+HTML = r"""<!doctype html>
 <html lang="id">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PokeDex Price — Dashboard</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<title>PokéDex Price</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
+/* ── Tokens ──────────────────────────────────────────────────────── */
 :root {
-  --pk-red:    #e53935;
-  --pk-gold:   #fdd835;
-  --pk-dark:   #0d0d1a;
-  --pk-card:   #16162a;
-  --pk-card2:  #1e1e36;
-  --pk-border: #2e2e50;
-  --pk-muted:  #7878a0;
-  --pk-text:   #ddddf0;
+  --bg:        #f5f6fa;
+  --surface:   #ffffff;
+  --border:    #e2e6ee;
+  --fg:        #1a1d2e;
+  --fg2:       #5a6180;
+  --fg3:       #8a92b0;
+  --accent:    #4361ee;
+  --accent2:   #3a0ca3;
+  --green:     #2dc653;
+  --green-bg:  #eaf9ee;
+  --red:       #e63946;
+  --red-bg:    #fff0f0;
+  --yellow:    #f4a261;
+  --yellow-bg: #fff8ee;
+  --poke-red:  #e63946;
+  --poke-blue: #4361ee;
+  --row-alt:   #f9fafd;
+  --shadow:    0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.04);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,.10);
+  color-scheme: light;
 }
-*  { box-sizing: border-box; }
-body { background: var(--pk-dark); color: var(--pk-text); font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:        #0f1117;
+    --surface:   #1a1d2e;
+    --border:    #2a2e45;
+    --fg:        #e8eaf6;
+    --fg2:       #9ea8d0;
+    --fg3:       #6270a0;
+    --accent:    #738bff;
+    --accent2:   #b388ff;
+    --green:     #4ade80;
+    --green-bg:  #0f2a1a;
+    --red:       #fc5c65;
+    --red-bg:    #2a0f12;
+    --yellow:    #fbbf24;
+    --yellow-bg: #2a1f0a;
+    --row-alt:   #1e2235;
+    --shadow:    0 1px 3px rgba(0,0,0,.3);
+    --shadow-lg: 0 4px 16px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:        #0f1117;
+  --surface:   #1a1d2e;
+  --border:    #2a2e45;
+  --fg:        #e8eaf6;
+  --fg2:       #9ea8d0;
+  --fg3:       #6270a0;
+  --accent:    #738bff;
+  --accent2:   #b388ff;
+  --green:     #4ade80;
+  --green-bg:  #0f2a1a;
+  --red:       #fc5c65;
+  --red-bg:    #2a0f12;
+  --yellow:    #fbbf24;
+  --yellow-bg: #2a1f0a;
+  --row-alt:   #1e2235;
+  --shadow:    0 1px 3px rgba(0,0,0,.3);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,.4);
+  color-scheme: dark;
+}
 
-/* Navbar */
-.navbar  { background: var(--pk-card) !important; border-bottom: 2px solid var(--pk-red); padding: .6rem 1rem; position: sticky; top:0; z-index:100; }
-.nb-logo { color: var(--pk-gold); font-weight: 800; font-size: 1.1rem; letter-spacing: -.3px; }
-.nb-logo small { color: var(--pk-muted); font-weight: 400; font-size: .7rem; display: block; line-height: 1; }
-.btn-refresh { background: none; border: 1px solid var(--pk-border); color: var(--pk-muted); border-radius: 8px; padding: 4px 10px; cursor: pointer; font-size: .85rem; transition: .2s; }
-.btn-refresh:hover { border-color: var(--pk-red); color: var(--pk-red); }
+/* ── Reset / Base ────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+img { max-width: 100%; }
 
-/* UID Bar */
-#uid-bar { background: var(--pk-card2); border-bottom: 1px solid var(--pk-border); padding: .4rem 1rem; display: flex; align-items: center; gap: .6rem; }
-#uid-bar label { color: var(--pk-muted); font-size: .8rem; white-space: nowrap; }
-#uid-select { background: var(--pk-card); border: 1px solid var(--pk-border); color: var(--pk-text); border-radius: 6px; padding: 3px 8px; font-size: .82rem; max-width: 220px; }
+/* ── Layout ──────────────────────────────────────────────────────── */
+.app-shell {
+  display: flex;
+  min-height: 100%;
+}
+.sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: var(--fg);
+  color: var(--bg);
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+.main {
+  flex: 1;
+  min-width: 0;
+  padding: 24px;
+  overflow-x: hidden;
+}
+@media (max-width: 768px) {
+  .app-shell { flex-direction: column; }
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 8px 16px;
+    gap: 8px;
+  }
+  .sidebar .logo { margin-bottom: 0; padding: 0; border-bottom: none; }
+  .sidebar .nav-section { display: flex; gap: 4px; flex-wrap: wrap; }
+  .sidebar .nav-section h4 { display: none; }
+  .main { padding: 16px; }
+}
 
-/* Stat Cards */
-.stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: .6rem; padding: .8rem; }
-@media(min-width:768px){ .stats-grid { grid-template-columns: repeat(4,1fr); } }
-.scard { background: var(--pk-card); border: 1px solid var(--pk-border); border-radius: 12px; padding: 1rem 1.1rem; transition: transform .15s; }
-.scard:hover { transform: translateY(-2px); }
-.scard .lbl  { color: var(--pk-muted); font-size: .72rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: .3rem; }
-.scard .val  { font-size: 1.5rem; font-weight: 700; line-height: 1.1; }
-.scard .sub  { color: var(--pk-muted); font-size: .78rem; margin-top: .15rem; }
-.c-gold  { color: var(--pk-gold); }
-.c-green { color: #66bb6a; }
-.c-red   { color: #ef5350; }
-.c-blue  { color: #42a5f5; }
-.c-muted { color: var(--pk-muted); }
+/* ── Sidebar ─────────────────────────────────────────────────────── */
+.logo {
+  padding: 20px 16px 16px;
+  border-bottom: 1px solid rgba(255,255,255,.08);
+  margin-bottom: 8px;
+}
+.logo-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -.3px;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.logo-ball {
+  width: 22px; height: 22px;
+  background: conic-gradient(#e63946 0deg 180deg, #fff 180deg 184deg, #1a1d2e 184deg 360deg);
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.3);
+  flex-shrink: 0;
+}
+.logo-sub { font-size: 11px; color: rgba(255,255,255,.4); margin-top: 2px; letter-spacing: .3px; }
+.nav-section { padding: 0 8px 12px; }
+.nav-section h4 {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  color: rgba(255,255,255,.3);
+  padding: 10px 8px 4px;
+}
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  color: rgba(255,255,255,.7);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.nav-link:hover, .nav-link.active {
+  background: rgba(255,255,255,.1);
+  color: #fff;
+  text-decoration: none;
+}
+.nav-link .icon { font-size: 15px; width: 18px; text-align: center; }
+.nav-count {
+  margin-left: auto;
+  background: rgba(255,255,255,.15);
+  border-radius: 20px;
+  font-size: 11px;
+  padding: 1px 6px;
+}
+.theme-toggle {
+  margin-top: auto;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(255,255,255,.08);
+}
+.theme-btn {
+  width: 100%;
+  padding: 7px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,.15);
+  background: transparent;
+  color: rgba(255,255,255,.6);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.theme-btn:hover { background: rgba(255,255,255,.08); color: #fff; }
 
-/* Tabs */
-.tabs-row { display: flex; gap: 0; border-bottom: 1px solid var(--pk-border); padding: 0 .8rem; background: var(--pk-card); overflow-x: auto; }
-.tab-btn  { background: none; border: none; color: var(--pk-muted); padding: .65rem .9rem; font-size: .82rem; cursor: pointer; border-bottom: 2px solid transparent; white-space: nowrap; transition: .15s; }
-.tab-btn:hover  { color: var(--pk-text); }
-.tab-btn.active { color: var(--pk-gold); border-bottom-color: var(--pk-gold); font-weight: 600; }
+/* ── Section/Page ────────────────────────────────────────────────── */
+.page { display: none; }
+.page.active { display: block; }
 
-/* Content */
-.content { padding: .8rem; }
-.box { background: var(--pk-card); border: 1px solid var(--pk-border); border-radius: 12px; padding: 1rem; margin-bottom: .8rem; }
-.box-title { color: var(--pk-gold); font-size: .78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; margin-bottom: .8rem; }
+/* ── Page header ─────────────────────────────────────────────────── */
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+.page-title { font-size: 20px; font-weight: 700; letter-spacing: -.3px; }
+.page-sub { font-size: 13px; color: var(--fg2); margin-left: 4px; }
 
-/* Charts Grid */
-.charts-grid { display: grid; grid-template-columns: 1fr; gap: .8rem; }
-@media(min-width:768px){ .charts-grid { grid-template-columns: 2fr 1fr; } }
-.charts-grid-2 { display: grid; grid-template-columns: 1fr; gap: .8rem; }
-@media(min-width:768px){ .charts-grid-2 { grid-template-columns: 1fr 1fr; } }
+/* ── Stat grid ───────────────────────────────────────────────────── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+.stat-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  color: var(--fg3);
+  margin-bottom: 4px;
+}
+.stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+}
+.stat-sub {
+  font-size: 11px;
+  color: var(--fg3);
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.stat-value.green { color: var(--green); }
+.stat-value.red   { color: var(--red); }
+.stat-value.blue  { color: var(--accent); }
 
-/* Table */
-.pk-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
-.pk-table th { color: var(--pk-muted); font-weight: 500; padding: .4rem .6rem; border-bottom: 1px solid var(--pk-border); text-align: left; white-space: nowrap; }
-.pk-table td { padding: .45rem .6rem; border-bottom: 1px solid var(--pk-border); vertical-align: middle; }
-.pk-table tr:last-child td { border-bottom: none; }
-.pk-table tr:hover td { background: var(--pk-card2); }
-.pk-table .text-right { text-align: right; }
-.pk-table .text-center { text-align: center; }
+/* ── Card / Surface ──────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  margin-bottom: 20px;
+  overflow: hidden;
+}
+.card-header {
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.card-body { padding: 16px; }
+.card-body.no-pad { padding: 0; }
 
-/* Badges */
-.badge-cond { font-size: .68rem; padding: 2px 5px; border-radius: 4px; font-weight: 600; }
-.b-mint  { background: #00695c; color: #fff; }
-.b-nm    { background: #2e7d32; color: #fff; }
-.b-lp    { background: #1565c0; color: #fff; }
-.b-mp    { background: #bf360c; color: #fff; }
-.b-hp    { background: #b71c1c; color: #fff; }
-.b-dmg   { background: #4a148c; color: #fff; }
-.b-unk   { background: #37474f; color: #ccc; }
-.badge-sale { background: var(--pk-red); color: #fff; font-size: .65rem; padding: 1px 5px; border-radius: 3px; font-weight: 700; }
-.badge-psa  { background: var(--pk-gold); color: #000; font-size: .65rem; padding: 1px 5px; border-radius: 3px; font-weight: 700; }
-.badge-priority { font-size: .65rem; padding: 1px 5px; border-radius: 3px; }
+/* ── Search / Filter bar ─────────────────────────────────────────── */
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+.search-input {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  width: 200px;
+}
+.search-input:focus { border-color: var(--accent); }
+select.filter-select {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+}
+select.filter-select:focus { border-color: var(--accent); }
 
-/* Search */
-.search-box { background: var(--pk-dark); border: 1px solid var(--pk-border); color: var(--pk-text); border-radius: 8px; padding: .4rem .8rem; font-size: .85rem; width: 100%; outline: none; }
-.search-box:focus { border-color: var(--pk-red); }
-select.search-box { cursor: pointer; }
-.search-row { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: .8rem; }
-.search-row .search-box { flex: 1; min-width: 140px; }
+/* ── Tables ──────────────────────────────────────────────────────── */
+.table-wrap { overflow-x: auto; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+thead th {
+  padding: 10px 12px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--fg3);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+thead th:hover { color: var(--fg2); }
+thead th.sort-asc::after  { content: ' ↑'; color: var(--accent); }
+thead th.sort-desc::after { content: ' ↓'; color: var(--accent); }
+tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background .1s;
+}
+tbody tr:nth-child(even) { background: var(--row-alt); }
+tbody tr:hover { background: rgba(67,97,238,.06); }
+tbody td { padding: 9px 12px; color: var(--fg); vertical-align: middle; }
+.td-name {
+  font-weight: 500;
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.td-set { color: var(--fg2); font-size: 12px; }
+.td-num { text-align: right; }
 
-/* Pagination */
-.pag { display: flex; gap: .3rem; justify-content: center; margin-top: .8rem; flex-wrap: wrap; }
-.pag-btn { background: var(--pk-card2); border: 1px solid var(--pk-border); color: var(--pk-text); border-radius: 6px; padding: 3px 10px; font-size: .8rem; cursor: pointer; }
-.pag-btn:hover  { border-color: var(--pk-red); }
-.pag-btn.active { background: var(--pk-red); border-color: var(--pk-red); color: #fff; }
+/* ── Badges ──────────────────────────────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge-green  { background: var(--green-bg);  color: var(--green); }
+.badge-red    { background: var(--red-bg);    color: var(--red); }
+.badge-yellow { background: var(--yellow-bg); color: var(--yellow); }
+.badge-blue   { background: rgba(67,97,238,.12); color: var(--accent); }
+.badge-gray   { background: var(--border); color: var(--fg2); }
 
-/* Spinner */
-.spin-wrap { text-align: center; padding: 2rem; color: var(--pk-muted); font-size: .9rem; }
-.spin { display: inline-block; animation: spin 1s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
+/* ── P&L coloring ────────────────────────────────────────────────── */
+.pnl-pos { color: var(--green); font-weight: 600; }
+.pnl-neg { color: var(--red);   font-weight: 600; }
+.pnl-zero{ color: var(--fg3); }
 
-/* ROI */
-.pos { color: #66bb6a; }
-.neg { color: #ef5350; }
-.neu { color: var(--pk-muted); }
+/* ── Chart area ──────────────────────────────────────────────────── */
+.chart-wrap {
+  position: relative;
+  width: 100%;
+}
+.chart-wrap canvas { max-height: 260px; }
+.chart-wrap-tall canvas { max-height: 320px; }
 
-/* Rank badge */
-.rank { color: var(--pk-muted); font-size: .8rem; min-width: 22px; }
-.rank-1 { color: var(--pk-gold); }
-.rank-2 { color: #b0bec5; }
-.rank-3 { color: #cd7f32; }
+/* ── Top-N list ──────────────────────────────────────────────────── */
+.top-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.top-row:last-child { border-bottom: none; }
+.top-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--fg3);
+  flex-shrink: 0;
+}
+.top-num.gold   { background: #ffd700; border-color: #e6c200; color: #7a5700; }
+.top-num.silver { background: #c0c0c0; border-color: #aaa; color: #555; }
+.top-num.bronze { background: #cd7f32; border-color: #b06420; color: #fff; }
+.top-info { flex: 1; min-width: 0; }
+.top-name {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.top-set { font-size: 11px; color: var(--fg3); }
+.top-price { font-weight: 700; color: var(--fg); white-space: nowrap; }
 
-/* Hide helper */
-.d-none { display: none !important; }
+/* ── Portfolio chart + top row ───────────────────────────────────── */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+@media (max-width: 960px) { .two-col { grid-template-columns: 1fr; } }
 
-::-webkit-scrollbar { width: 5px; height: 5px; }
-::-webkit-scrollbar-track { background: var(--pk-dark); }
-::-webkit-scrollbar-thumb { background: var(--pk-border); border-radius: 3px; }
+/* ── Empty state ─────────────────────────────────────────────────── */
+.empty {
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--fg3);
+}
+.empty .icon { font-size: 36px; margin-bottom: 8px; }
+.empty p { font-size: 13px; }
+
+/* ── Pagination ──────────────────────────────────────────────────── */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--fg3);
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pag-btns { display: flex; gap: 4px; }
+.pag-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--fg2);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.pag-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pag-btn:disabled { opacity: .4; cursor: default; }
+.pag-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* ── Modal ───────────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.55);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+  opacity: 0; pointer-events: none;
+  transition: opacity .2s;
+}
+.modal-overlay.open { opacity: 1; pointer-events: auto; }
+.modal {
+  background: var(--surface);
+  border-radius: 12px;
+  width: 700px;
+  max-width: 96vw;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-lg);
+  transform: translateY(12px);
+  transition: transform .2s;
+}
+.modal-overlay.open .modal { transform: translateY(0); }
+.modal-header {
+  padding: 16px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+}
+.modal-title { font-size: 16px; font-weight: 700; flex: 1; }
+.modal-close {
+  background: none; border: none; cursor: pointer;
+  color: var(--fg3); font-size: 20px; line-height: 1; padding: 2px 4px;
+}
+.modal-close:hover { color: var(--fg); }
+.modal-body { padding: 20px; }
+
+/* ── Misc ────────────────────────────────────────────────────────── */
+.flex { display: flex; align-items: center; gap: 8px; }
+.spacer { flex: 1; }
+.text-muted { color: var(--fg3); }
+.text-sm { font-size: 12px; }
+.mono { font-family: 'Fira Mono', monospace; }
+.grade-pill {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4361ee, #3a0ca3);
+  color: #fff;
+  font-size: 12px; font-weight: 700;
+}
+.for-sale-dot {
+  display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--green);
+  margin-right: 3px;
+}
 </style>
 </head>
 <body>
+<div class="app-shell">
 
-<!-- Navbar -->
-<nav class="navbar d-flex justify-content-between align-items-center">
-  <div class="nb-logo">⚡ PokeDex Price <small>Web Dashboard</small></div>
-  <div class="d-flex align-items-center gap-2">
-    <span id="last-upd" style="color:var(--pk-muted);font-size:.72rem"></span>
-    <button class="btn-refresh" onclick="loadAll()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+<!-- ── Sidebar ─────────────────────────────────────────────────────── -->
+<aside class="sidebar">
+  <div class="logo">
+    <div class="logo-title">
+      <div class="logo-ball"></div>
+      PokéDex Price
+    </div>
+    <div class="logo-sub">TCG Portfolio Tracker</div>
   </div>
-</nav>
 
-<!-- UID Bar -->
-<div id="uid-bar">
-  <label>👤 User:</label>
-  <select id="uid-select" onchange="loadAll()">
-    <option value="">Semua User</option>
-  </select>
-  <span id="uid-info" style="color:var(--pk-muted);font-size:.75rem"></span>
-</div>
+  <nav class="nav-section">
+    <h4>Menu</h4>
+    <a class="nav-link active" onclick="showPage('dashboard')">
+      <span class="icon">📊</span> Dashboard
+    </a>
+    <a class="nav-link" onclick="showPage('inventory')">
+      <span class="icon">🗃️</span> Inventory
+      <span class="nav-count" id="nc-inv">—</span>
+    </a>
+    <a class="nav-link" onclick="showPage('wishlist')">
+      <span class="icon">⭐</span> Wishlist
+      <span class="nav-count" id="nc-wish">—</span>
+    </a>
+    <a class="nav-link" onclick="showPage('graded')">
+      <span class="icon">🏆</span> Graded
+      <span class="nav-count" id="nc-graded">—</span>
+    </a>
+    <a class="nav-link" onclick="showPage('trade')">
+      <span class="icon">🔄</span> Trade
+      <span class="nav-count" id="nc-trade">—</span>
+    </a>
+    <a class="nav-link" onclick="showPage('sold')">
+      <span class="icon">💸</span> Sold
+      <span class="nav-count" id="nc-sold">—</span>
+    </a>
+  </nav>
 
-<!-- Stat Cards -->
-<div class="stats-grid" id="stats-row">
-  <div class="scard">
-    <div class="lbl">💰 Total Value</div>
-    <div class="val c-gold" id="s-usd">—</div>
-    <div class="sub"   id="s-idr">—</div>
+  <div class="theme-toggle">
+    <button class="theme-btn" onclick="toggleTheme()">🌙 Toggle Theme</button>
   </div>
-  <div class="scard">
-    <div class="lbl">📈 ROI / Profit</div>
-    <div class="val"   id="s-roi">—</div>
-    <div class="sub"   id="s-profit">—</div>
-  </div>
-  <div class="scard">
-    <div class="lbl">🃏 Koleksi</div>
-    <div class="val c-blue" id="s-cards">—</div>
-    <div class="sub"        id="s-sets">—</div>
-  </div>
-  <div class="scard">
-    <div class="lbl">🏷️ Dijual</div>
-    <div class="val c-red" id="s-fs">—</div>
-    <div class="sub"       id="s-fsidr">—</div>
-  </div>
-</div>
+</aside>
 
-<!-- Tabs -->
-<div class="tabs-row">
-  <button class="tab-btn active" data-tab="overview">📊 Overview</button>
-  <button class="tab-btn"        data-tab="collection">🃏 Koleksi</button>
-  <button class="tab-btn"        data-tab="forsale">🏷️ Dijual</button>
-  <button class="tab-btn"        data-tab="trades">💸 Sales</button>
-  <button class="tab-btn"        data-tab="wishlist">⭐ Wishlist</button>
-</div>
+<!-- ── Main ────────────────────────────────────────────────────────── -->
+<main class="main">
 
-<!-- ═══════════ TAB: OVERVIEW ═══════════ -->
-<div class="content" id="tab-overview">
+<!-- ═══════════ DASHBOARD ═══════════ -->
+<section id="page-dashboard" class="page active">
+  <div class="page-header">
+    <span class="page-title">Portfolio Overview</span>
+    <span class="page-sub" id="last-updated"></span>
+  </div>
 
-  <div class="charts-grid">
-    <div class="box">
-      <div class="box-title">📈 Portfolio Value — 30 Hari</div>
-      <div style="position:relative;height:200px"><canvas id="chart-portfolio"></canvas></div>
-      <div id="chart-portfolio-empty" class="d-none spin-wrap" style="height:200px;padding-top:70px">
-        Belum ada data snapshot.<br><small>Bot otomatis snapshot setiap hari.</small>
+  <div class="stat-grid" id="stat-grid">
+    <div class="stat-card"><div class="stat-label">Total Value (USD)</div><div class="stat-value blue" id="s-usd">—</div><div class="stat-sub" id="s-idr">—</div></div>
+    <div class="stat-card"><div class="stat-label">Kartu</div><div class="stat-value" id="s-count">—</div><div class="stat-sub" id="s-sets">—</div></div>
+    <div class="stat-card"><div class="stat-label">P&amp;L (USD)</div><div class="stat-value" id="s-pnl">—</div><div class="stat-sub" id="s-pnl-pct">—</div></div>
+    <div class="stat-card"><div class="stat-label">Graded</div><div class="stat-value" id="s-graded">—</div><div class="stat-sub">cards</div></div>
+    <div class="stat-card"><div class="stat-label">For Sale</div><div class="stat-value green" id="s-forsale">—</div><div class="stat-sub">cards listed</div></div>
+    <div class="stat-card"><div class="stat-label">Wishlist</div><div class="stat-value" id="s-wish">—</div><div class="stat-sub" id="s-wish-val">items</div></div>
+  </div>
+
+  <div class="two-col">
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">📈 Portfolio Value History</span>
+        <span class="spacer"></span>
+        <select class="filter-select" onchange="loadPortfolioChart(this.value)">
+          <option value="30">30 hari</option>
+          <option value="90">90 hari</option>
+          <option value="365">1 tahun</option>
+          <option value="0">Semua</option>
+        </select>
+      </div>
+      <div class="card-body">
+        <div class="chart-wrap-tall chart-wrap"><canvas id="portfolioChart"></canvas></div>
       </div>
     </div>
-    <div class="box">
-      <div class="box-title">🥧 Per Kondisi</div>
-      <div style="position:relative;height:200px"><canvas id="chart-condition"></canvas></div>
+
+    <div class="card">
+      <div class="card-header"><span class="card-title">🏅 Top 10 Most Valuable</span></div>
+      <div id="top10-list">
+        <div class="empty"><div class="icon">⏳</div><p>Loading…</p></div>
+      </div>
     </div>
   </div>
 
-  <div class="charts-grid-2">
-    <div class="box">
-      <div class="box-title">📂 Value Per Set (Top 8)</div>
-      <div style="position:relative;height:180px"><canvas id="chart-sets"></canvas></div>
+  <div class="two-col">
+    <div class="card">
+      <div class="card-header"><span class="card-title">🍕 Portfolio by Set</span></div>
+      <div class="card-body">
+        <div class="chart-wrap"><canvas id="setChart"></canvas></div>
+      </div>
     </div>
-    <div class="box">
-      <div class="box-title">🏆 Top 10 Kartu</div>
-      <div id="top-cards"></div>
+    <div class="card">
+      <div class="card-header"><span class="card-title">📦 Condition Breakdown</span></div>
+      <div class="card-body">
+        <div class="chart-wrap"><canvas id="condChart"></canvas></div>
+      </div>
     </div>
   </div>
+</section>
 
-</div>
-
-<!-- ═══════════ TAB: KOLEKSI ═══════════ -->
-<div class="content d-none" id="tab-collection">
-  <div class="box">
-    <div class="search-row">
-      <input type="text"   id="sq"    class="search-box" placeholder="🔍 Cari nama kartu..." oninput="debSearch()">
-      <select              id="sset"  class="search-box" onchange="doSearch(1)" style="max-width:180px">
+<!-- ═══════════ INVENTORY ═══════════ -->
+<section id="page-inventory" class="page">
+  <div class="page-header">
+    <span class="page-title">Inventory</span>
+    <div class="filter-bar">
+      <input class="search-input" id="inv-search" placeholder="🔍 Cari kartu…" oninput="filterInventory()">
+      <select class="filter-select" id="inv-filter-set" onchange="filterInventory()">
         <option value="">Semua Set</option>
       </select>
+      <select class="filter-select" id="inv-filter-cond" onchange="filterInventory()">
+        <option value="">Semua Kondisi</option>
+        <option>Mint</option>
+        <option>Near Mint</option>
+        <option>Lightly Played</option>
+        <option>Moderately Played</option>
+        <option>Heavily Played</option>
+        <option>Damaged</option>
+      </select>
+      <select class="filter-select" id="inv-filter-folder" onchange="filterInventory()">
+        <option value="">Semua Folder</option>
+      </select>
     </div>
-    <div id="cards-wrap"><div class="spin-wrap"><span class="spin">⚽</span> Loading...</div></div>
-    <div id="cards-pag" class="pag"></div>
+  </div>
+  <div class="card">
+    <div class="card-body no-pad">
+      <div class="table-wrap">
+        <table id="inv-table">
+          <thead>
+            <tr>
+              <th onclick="sortTable('inv','card_name')">#  Kartu</th>
+              <th onclick="sortTable('inv','card_set')">Set</th>
+              <th onclick="sortTable('inv','condition')">Kondisi</th>
+              <th onclick="sortTable('inv','psa_grade')">Grade</th>
+              <th onclick="sortTable('inv','price_usd')" class="td-num">Harga Pasar</th>
+              <th onclick="sortTable('inv','buy_price_usd')" class="td-num">Beli</th>
+              <th onclick="sortTable('inv','pnl')" class="td-num">P&amp;L</th>
+              <th>Folder</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="inv-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pagination" id="inv-pag"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ WISHLIST ═══════════ -->
+<section id="page-wishlist" class="page">
+  <div class="page-header"><span class="page-title">⭐ Wishlist</span></div>
+  <div class="card">
+    <div class="card-body no-pad">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Kartu</th>
+              <th>Set</th>
+              <th class="td-num">Harga Pasar</th>
+              <th class="td-num">Target</th>
+              <th class="td-num">Gap</th>
+              <th>Ditambah</th>
+            </tr>
+          </thead>
+          <tbody id="wish-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ GRADED ═══════════ -->
+<section id="page-graded" class="page">
+  <div class="page-header"><span class="page-title">🏆 Graded Cards</span></div>
+  <div class="card">
+    <div class="card-body no-pad">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Kartu</th>
+              <th>Set</th>
+              <th class="td-num">Grade</th>
+              <th class="td-num">Harga Pasar</th>
+              <th class="td-num">Ref Price</th>
+              <th class="td-num">Perubahan</th>
+            </tr>
+          </thead>
+          <tbody id="graded-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ TRADE ═══════════ -->
+<section id="page-trade" class="page">
+  <div class="page-header"><span class="page-title">🔄 Trade Offers</span></div>
+  <div class="card">
+    <div class="card-body no-pad">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Punya</th>
+              <th>Mau</th>
+              <th>Status</th>
+              <th>Tanggal</th>
+            </tr>
+          </thead>
+          <tbody id="trade-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ SOLD ═══════════ -->
+<section id="page-sold" class="page">
+  <div class="page-header"><span class="page-title">💸 Sold History</span></div>
+  <div class="stat-grid">
+    <div class="stat-card"><div class="stat-label">Total Terjual</div><div class="stat-value" id="sold-count">—</div></div>
+    <div class="stat-card"><div class="stat-label">Total Revenue</div><div class="stat-value green" id="sold-rev">—</div></div>
+    <div class="stat-card"><div class="stat-label">Total Profit</div><div class="stat-value" id="sold-profit">—</div></div>
+  </div>
+  <div class="card">
+    <div class="card-body no-pad">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Kartu</th>
+              <th>Set</th>
+              <th class="td-num">Jual</th>
+              <th class="td-num">Beli</th>
+              <th class="td-num">Profit</th>
+              <th>Tanggal</th>
+            </tr>
+          </thead>
+          <tbody id="sold-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main><!-- end .main -->
+</div><!-- end .app-shell -->
+
+<!-- ── Price History Modal ─────────────────────────────────────────── -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modal-card-name">—</span>
+      <button class="modal-close" onclick="document.getElementById('modal-overlay').classList.remove('open')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="stat-grid" id="modal-stats"></div>
+      <div class="chart-wrap-tall chart-wrap" style="margin-bottom:16px"><canvas id="priceHistChart"></canvas></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tanggal</th><th class="td-num">USD</th><th class="td-num">IDR</th></tr></thead>
+          <tbody id="modal-hist-tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
-<!-- ═══════════ TAB: FOR SALE ═══════════ -->
-<div class="content d-none" id="tab-forsale">
-  <div class="box">
-    <div class="box-title">🏷️ Kartu Dijual</div>
-    <div id="fs-wrap"><div class="spin-wrap"><span class="spin">⚽</span> Loading...</div></div>
-  </div>
-</div>
-
-<!-- ═══════════ TAB: SALES ═══════════ -->
-<div class="content d-none" id="tab-trades">
-  <div class="box">
-    <div class="box-title">💸 Riwayat Penjualan (20 Terakhir)</div>
-    <div id="trades-wrap"><div class="spin-wrap"><span class="spin">⚽</span> Loading...</div></div>
-  </div>
-</div>
-
-<!-- ═══════════ TAB: WISHLIST ═══════════ -->
-<div class="content d-none" id="tab-wishlist">
-  <div class="box">
-    <div class="box-title">⭐ Wishlist</div>
-    <div id="wish-wrap"><div class="spin-wrap"><span class="spin">⚽</span> Loading...</div></div>
-  </div>
-</div>
-
+<!-- ══════════════════════════════════════════════════════════════════ -->
 <script>
-const RATE = """ + str(RATE) + r""";
-let charts = {};
-let curPage = 1;
-let searchTimer;
-let activeTab = 'overview';
+// ── State ────────────────────────────────────────────────────────────
+let inv = [], invFiltered = [], invPage = 1, invPerPage = 25;
+let invSort = { col: 'price_usd', dir: 'desc' };
+let portfolioChart, priceHistChart, setChart, condChart;
+const EXRATE = {{ exchange_rate }};
 
-// ── Utils ─────────────────────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
-const uid = () => $('uid-select').value;
-
-function fmt(n, d=2) {
-  if (n == null) return '—';
-  const v = parseFloat(n);
-  if (isNaN(v)) return '—';
-  return '$' + v.toFixed(d).replace(/\B(?=(\d{3})+(?!\d))/g,',');
-}
-function fmtIdr(usd) {
-  const v = parseFloat(usd||0) * RATE;
-  if (v >= 1000000) return 'Rp ' + (v/1000000).toFixed(1) + 'jt';
-  if (v >= 1000)    return 'Rp ' + (v/1000).toFixed(0) + 'rb';
-  return 'Rp ' + v.toFixed(0);
-}
-function condBadge(c) {
-  const m = {'Mint':'b-mint','Near Mint':'b-nm','Lightly Played':'b-lp',
-             'Moderately Played':'b-mp','Heavily Played':'b-hp','Damaged':'b-dmg'};
-  const s = {'Near Mint':'NM','Lightly Played':'LP','Moderately Played':'MP',
-             'Heavily Played':'HP','Damaged':'DMG','Mint':'M'};
-  return `<span class="badge-cond ${m[c]||'b-unk'}">${s[c]||c||'?'}</span>`;
-}
-function roiClass(r) { return r > 0 ? 'pos' : r < 0 ? 'neg' : 'neu'; }
-function roiStr(r)   { return r == null ? '—' : (r>0?'+':'')+r.toFixed(1)+'%'; }
-function calcRoi(price, buy) {
-  if (!buy || buy <= 0) return null;
-  return ((price - buy) / buy * 100);
-}
-const q = () => { const p = new URLSearchParams(); if(uid()) p.set('uid',uid()); return p; };
-
-// ── Users ─────────────────────────────────────────────────────────────────────
-async function loadUsers() {
-  const data = await fetch('/api/users').then(r=>r.json()).catch(()=>[]);
-  const sel = $('uid-select');
-  data.forEach(u => {
-    const o = document.createElement('option');
-    o.value = u.user_id; o.textContent = `ID ${u.user_id} (${u.cards} kartu)`;
-    sel.appendChild(o);
-  });
-  if (data.length === 1) sel.value = data[0].user_id;
-}
-
-// ── Stats ─────────────────────────────────────────────────────────────────────
-async function loadStats() {
-  const p = q(); const s = await fetch('/api/stats?'+p).then(r=>r.json()).catch(()=>({}));
-  $('s-usd').textContent    = fmt(s.total_usd);
-  $('s-idr').textContent    = fmtIdr(s.total_usd||0);
-  const roi = s.roi||0;
-  $('s-roi').textContent    = (roi>0?'+':'')+roi.toFixed(1)+'%';
-  $('s-roi').className      = 'val ' + roiClass(roi);
-  const ps = s.profit_usd||0;
-  $('s-profit').textContent = (ps>=0?'+':'')+fmt(ps) + ' profit';
-  $('s-cards').textContent  = (s.cards||0) + ' kartu';
-  $('s-sets').textContent   = (s.sets||0) + ' set · PSA ' + (s.psa_graded||0);
-  $('s-fs').textContent     = (s.fs_cnt||0) + ' kartu';
-  $('s-fsidr').textContent  = fmt(s.fs_ask||0) + ' ask total';
-  $('last-upd').textContent = new Date().toLocaleTimeString('id-ID');
-}
-
-// ── Charts ────────────────────────────────────────────────────────────────────
-const C = { // chart defaults
-  responsive: true, maintainAspectRatio: false,
-  plugins: { legend: { labels: { color:'#7878a0', font:{size:10} } } }
-};
-
-async function loadPortfolioChart() {
-  const p = q(); p.set('days','30');
-  const data = await fetch('/api/portfolio_history?'+p).then(r=>r.json()).catch(()=>[]);
-  const canvas = $('chart-portfolio');
-  const empty  = $('chart-portfolio-empty');
-
-  if (!data.length) {
-    canvas.classList.add('d-none');
-    empty.classList.remove('d-none');
-    return;
+// ── Theme ─────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const root = document.documentElement;
+  if (root.dataset.theme === 'dark') {
+    root.dataset.theme = 'light';
+    try { localStorage.setItem('theme','light'); } catch(e){}
+  } else {
+    root.dataset.theme = 'dark';
+    try { localStorage.setItem('theme','dark'); } catch(e){}
   }
-  canvas.classList.remove('d-none');
-  empty.classList.add('d-none');
+  redrawCharts();
+}
+try {
+  const t = localStorage.getItem('theme');
+  if (t) document.documentElement.dataset.theme = t;
+} catch(e){}
 
-  if (charts.portfolio) charts.portfolio.destroy();
-  charts.portfolio = new Chart(canvas.getContext('2d'), {
+function chartColors() {
+  const dark = document.documentElement.dataset.theme === 'dark' ||
+    (!document.documentElement.dataset.theme &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches);
+  return {
+    grid: dark ? 'rgba(255,255,255,.07)' : 'rgba(0,0,0,.06)',
+    text: dark ? '#9ea8d0' : '#8a92b0',
+    line: dark ? '#738bff' : '#4361ee',
+    lineGrad: dark ? ['rgba(115,139,255,.35)','rgba(115,139,255,.01)']
+                   : ['rgba(67,97,238,.3)','rgba(67,97,238,.01)'],
+    green: '#2dc653',
+    red:   '#e63946',
+  };
+}
+
+// ── Page navigation ───────────────────────────────────────────────────
+function showPage(id) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
+  document.getElementById('page-' + id).classList.add('active');
+  event.currentTarget.classList.add('active');
+
+  if (id === 'inventory' && inv.length === 0) loadInventory();
+  if (id === 'wishlist')  loadWishlist();
+  if (id === 'graded')    loadGraded();
+  if (id === 'trade')     loadTrade();
+  if (id === 'sold')      loadSold();
+}
+
+// ── API helpers ───────────────────────────────────────────────────────
+async function api(path) {
+  const r = await fetch(path);
+  return r.json();
+}
+
+// ── Dashboard init ────────────────────────────────────────────────────
+async function initDashboard() {
+  const [stats, top10, bySet, byCond] = await Promise.all([
+    api('/api/stats'),
+    api('/api/top10'),
+    api('/api/by-set'),
+    api('/api/by-condition'),
+  ]);
+
+  // Stats
+  const pnl = stats.total_market_usd - stats.total_buy_usd;
+  const pnlPct = stats.total_buy_usd > 0 ? (pnl / stats.total_buy_usd * 100).toFixed(1) : 0;
+  document.getElementById('s-usd').textContent = '$' + stats.total_market_usd.toFixed(2);
+  document.getElementById('s-idr').textContent = 'Rp ' + Math.round(stats.total_market_usd * EXRATE).toLocaleString('id-ID');
+  document.getElementById('s-count').textContent = stats.card_count;
+  document.getElementById('s-sets').textContent = stats.set_count + ' set berbeda';
+  const pelm = document.getElementById('s-pnl');
+  pelm.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+  pelm.className = 'stat-value ' + (pnl >= 0 ? 'green' : 'red');
+  document.getElementById('s-pnl-pct').textContent = (pnl >= 0 ? '+' : '') + pnlPct + '%';
+  document.getElementById('s-graded').textContent = stats.graded_count;
+  document.getElementById('s-forsale').textContent = stats.for_sale_count;
+  document.getElementById('s-wish').textContent = stats.wishlist_count;
+  document.getElementById('s-wish-val').textContent = 'items';
+  document.getElementById('last-updated').textContent =
+    'Updated: ' + new Date().toLocaleTimeString('id-ID');
+
+  // Nav counts
+  document.getElementById('nc-inv').textContent    = stats.card_count;
+  document.getElementById('nc-wish').textContent   = stats.wishlist_count;
+  document.getElementById('nc-graded').textContent = stats.graded_count;
+  document.getElementById('nc-trade').textContent  = stats.trade_count;
+  document.getElementById('nc-sold').textContent   = stats.sold_count;
+
+  // Top 10
+  const medals = ['gold','silver','bronze'];
+  document.getElementById('top10-list').innerHTML = top10.map((c,i) => `
+    <div class="top-row">
+      <div class="top-num ${medals[i]||''}">${i+1}</div>
+      <div class="top-info">
+        <div class="top-name">${esc(c.card_name)}</div>
+        <div class="top-set">${esc(c.card_set||'—')}</div>
+      </div>
+      <div class="top-price">$${c.price_usd.toFixed(2)}</div>
+    </div>
+  `).join('');
+
+  // Portfolio chart
+  await loadPortfolioChart(30);
+
+  // By-set doughnut
+  drawSetChart(bySet);
+
+  // Condition pie
+  drawCondChart(byCond);
+}
+
+// ── Portfolio chart ───────────────────────────────────────────────────
+async function loadPortfolioChart(days) {
+  const data = await api('/api/portfolio-history?days=' + days);
+  const c = chartColors();
+  const ctx = document.getElementById('portfolioChart');
+
+  if (portfolioChart) portfolioChart.destroy();
+  portfolioChart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels: data.map(d=>d.date),
+      labels: data.map(d => d.date),
       datasets: [{
-        label: 'Portfolio (USD)',
-        data: data.map(d=>d.value),
-        borderColor: '#e53935',
-        backgroundColor: 'rgba(229,57,53,.12)',
-        fill: true, tension: .4,
-        pointRadius: data.length < 15 ? 4 : 2,
-        pointBackgroundColor: '#e53935'
+        label: 'Portfolio USD',
+        data: data.map(d => d.total_usd),
+        borderColor: c.line,
+        borderWidth: 2,
+        tension: 0.4,
+        fill: true,
+        pointRadius: data.length > 60 ? 0 : 3,
+        pointHoverRadius: 5,
+        backgroundColor: ctx2 => {
+          const g = ctx2.chart.ctx.createLinearGradient(0, 0, 0, 260);
+          g.addColorStop(0, c.lineGrad[0]);
+          g.addColorStop(1, c.lineGrad[1]);
+          return g;
+        },
       }]
     },
     options: {
-      ...C,
-      scales: {
-        x: { ticks:{color:'#555',maxTicksLimit:7,font:{size:9}}, grid:{color:'#1e1e36'} },
-        y: { ticks:{color:'#555',callback:v=>'$'+v.toFixed(0)}, grid:{color:'#1e1e36'} }
+      responsive: true, maintainAspectRatio: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ' $' + ctx.parsed.y.toFixed(2)
+          }
+        }
       },
-      plugins: { ...C.plugins, tooltip:{callbacks:{label:c=>fmt(c.parsed.y)}} }
-    }
-  });
-}
-
-async function loadConditionChart() {
-  const p = q();
-  const data = await fetch('/api/by_condition?'+p).then(r=>r.json()).catch(()=>[]);
-  if (charts.cond) charts.cond.destroy();
-  charts.cond = new Chart($('chart-condition').getContext('2d'), {
-    type: 'doughnut',
-    data: {
-      labels: data.map(d=>d.cond + ' ('+d.cnt+')'),
-      datasets: [{ data: data.map(d=>d.total_usd),
-        backgroundColor: ['#00897b','#1e88e5','#43a047','#fb8c00','#e53935','#8e24aa','#fdd83566'],
-        borderWidth: 0
-      }]
-    },
-    options: { ...C, plugins: { ...C.plugins,
-      tooltip: { callbacks:{ label: c => c.label+': '+fmt(c.parsed) } }
-    }}
-  });
-}
-
-async function loadSetsChart() {
-  const p = q();
-  const data = (await fetch('/api/by_set?'+p).then(r=>r.json()).catch(()=>[])).slice(0,8);
-  if (charts.sets) charts.sets.destroy();
-  charts.sets = new Chart($('chart-sets').getContext('2d'), {
-    type: 'bar',
-    data: {
-      labels: data.map(d => d.set_name.length>14 ? d.set_name.slice(0,14)+'…' : d.set_name),
-      datasets: [{ label:'USD', data: data.map(d=>d.total_usd),
-        backgroundColor:'rgba(229,57,53,.7)', borderColor:'#e53935',
-        borderWidth:1, borderRadius:4
-      }]
-    },
-    options: { ...C,
       scales: {
-        x: { ticks:{color:'#555',font:{size:9}}, grid:{display:false} },
-        y: { ticks:{color:'#555',callback:v=>'$'+v}, grid:{color:'#1e1e36'} }
+        x: {
+          grid: { color: c.grid },
+          ticks: { color: c.text, maxTicksLimit: 8, font: { size: 11 } }
+        },
+        y: {
+          grid: { color: c.grid },
+          ticks: { color: c.text, font: { size: 11 },
+            callback: v => '$' + v.toFixed(0) }
+        }
       }
     }
   });
 }
 
-async function loadTopCards() {
-  const p = q(); p.set('limit','10');
-  const data = await fetch('/api/top_cards?'+p).then(r=>r.json()).catch(()=>[]);
-  const rankCls = ['','rank-1','rank-2','rank-3'];
-  const html = data.map((c,i) => {
-    const roi = calcRoi(c.price_usd, c.buy_price_usd);
-    const fsTag  = c.for_sale  ? '<span class="badge-sale ms-1">SALE</span>' : '';
-    const psaTag = c.psa_grade ? `<span class="badge-psa ms-1">PSA ${c.psa_grade}</span>` : '';
-    return `<div style="display:flex;align-items:center;gap:.5rem;padding:.4rem 0;border-bottom:1px solid var(--pk-border)">
-      <span class="rank ${rankCls[i+1]||''}">#${i+1}</span>
-      <div style="flex:1;overflow:hidden">
-        <div style="font-size:.82rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
-          ${c.card_name}${fsTag}${psaTag}
-        </div>
-        <div style="font-size:.72rem;color:var(--pk-muted)">${c.card_set||'—'} · ${condBadge(c.condition)}</div>
-      </div>
-      <div style="text-align:right">
-        <div style="font-size:.85rem;font-weight:700;color:var(--pk-gold)">${fmt(c.price_usd)}</div>
-        ${roi!=null ? `<div style="font-size:.72rem" class="${roiClass(roi)}">${roiStr(roi)}</div>` : ''}
-      </div>
-    </div>`;
-  }).join('');
-  $('top-cards').innerHTML = html || '<div class="spin-wrap">Koleksi kosong</div>';
-}
-
-// ── Collection Tab ────────────────────────────────────────────────────────────
-async function loadSetsList() {
-  const p = q();
-  const sets = await fetch('/api/sets_list?'+p).then(r=>r.json()).catch(()=>[]);
-  const sel = $('sset');
-  sel.innerHTML = '<option value="">Semua Set</option>';
-  sets.forEach(s => { const o = document.createElement('option'); o.value=o.textContent=s; sel.appendChild(o); });
-}
-
-async function doSearch(page=1) {
-  curPage = page;
-  const p = q();
-  const qv = $('sq').value;
-  const sv = $('sset').value;
-  if (qv) p.set('q', qv);
-  if (sv) p.set('set', sv);
-  p.set('page', page);
-  $('cards-wrap').innerHTML = '<div class="spin-wrap"><span class="spin">⚽</span></div>';
-  const data = await fetch('/api/cards?'+p).then(r=>r.json()).catch(()=>({cards:[],total:0,pages:1}));
-  const rows = data.cards.map(c => {
-    const roi = calcRoi(c.price_usd, c.buy_price_usd);
-    const fsTag  = c.for_sale  ? '<span class="badge-sale ms-1">SALE</span>' : '';
-    const psaTag = c.psa_grade ? `<span class="badge-psa ms-1">PSA ${c.psa_grade}</span>` : '';
-    const noteRow = c.notes ? `<tr><td colspan="6" style="padding-top:0;padding-bottom:.4rem">
-      <small style="color:var(--pk-gold);opacity:.8">📝 ${c.notes}</small></td></tr>` : '';
-    return `<tr>
-      <td class="c-muted" style="font-size:.75rem">#${c.id}</td>
-      <td><span style="font-weight:600">${c.card_name}</span>${fsTag}${psaTag}</td>
-      <td class="c-muted" style="font-size:.75rem">${c.card_set||'—'}</td>
-      <td>${condBadge(c.condition)}</td>
-      <td class="text-right" style="font-weight:700;color:var(--pk-gold)">${fmt(c.price_usd)}</td>
-      <td class="text-right ${roi!=null?roiClass(roi):'c-muted'}">${roiStr(roi)}</td>
-    </tr>${noteRow}`;
-  }).join('');
-  const tbl = `<div style="overflow-x:auto"><table class="pk-table">
-    <thead><tr><th>#</th><th>Kartu</th><th>Set</th><th>Kondisi</th><th class="text-right">Harga</th><th class="text-right">ROI</th></tr></thead>
-    <tbody>${rows||'<tr><td colspan="6" class="spin-wrap">Tidak ada kartu</td></tr>'}</tbody>
-  </table></div>`;
-  $('cards-wrap').innerHTML = tbl;
-  $('cards-pag').innerHTML = Array.from({length:data.pages},(_, i)=>
-    `<button class="pag-btn ${i+1===page?'active':''}" onclick="doSearch(${i+1})">${i+1}</button>`
-  ).join('');
-}
-function debSearch() { clearTimeout(searchTimer); searchTimer = setTimeout(()=>doSearch(1), 350); }
-
-// ── For Sale Tab ──────────────────────────────────────────────────────────────
-async function loadForSale() {
-  const p = q();
-  const data = await fetch('/api/for_sale?'+p).then(r=>r.json()).catch(()=>[]);
-  if (!data.length) { $('fs-wrap').innerHTML='<div class="spin-wrap">Tidak ada kartu yang dijual 🏷️</div>'; return; }
-  let total = 0;
-  const rows = data.map(c => {
-    const base = c.buy_price_usd || c.price_usd || 0;
-    const profit = (c.ask_price_usd||0) - base;
-    const ps = profit >= 0 ? '+' : '';
-    const psaTag = c.psa_grade ? `<span class="badge-psa ms-1">PSA ${c.psa_grade}</span>` : '';
-    total += (c.ask_price_usd||0);
-    return `<tr>
-      <td><div style="font-weight:600">${c.card_name}${psaTag}</div>
-          <div class="c-muted" style="font-size:.72rem">${c.card_set||'—'}
-            ${c.notes?`<br><span style="color:var(--pk-gold)">📝 ${c.notes}</span>`:''}
-          </div></td>
-      <td>${condBadge(c.condition)}</td>
-      <td class="text-right" style="font-weight:700;color:var(--pk-gold)">${fmt(c.ask_price_usd)}</td>
-      <td class="text-right c-muted">${fmt(c.price_usd)}</td>
-      <td class="text-right ${profit>=0?'pos':'neg'}">${ps}${fmt(profit)}</td>
-    </tr>`;
-  }).join('');
-  $('fs-wrap').innerHTML = `<div style="overflow-x:auto"><table class="pk-table">
-    <thead><tr><th>Kartu</th><th>Kondisi</th><th class="text-right">Ask</th><th class="text-right">Market</th><th class="text-right">Profit</th></tr></thead>
-    <tbody>${rows}</tbody>
-    <tfoot><tr style="border-top:2px solid var(--pk-border)">
-      <td colspan="2" class="c-muted">Total ${data.length} kartu</td>
-      <td class="text-right" style="font-weight:700;color:var(--pk-gold)">${fmt(total)}</td>
-      <td class="text-right c-muted">${fmtIdr(total)}</td><td></td>
-    </tr></tfoot>
-  </table></div>`;
-}
-
-// ── Trades Tab ────────────────────────────────────────────────────────────────
-async function loadTrades() {
-  const p = q();
-  const data = await fetch('/api/recent_trades?'+p).then(r=>r.json()).catch(()=>[]);
-  if (!data.length) { $('trades-wrap').innerHTML='<div class="spin-wrap">Belum ada riwayat penjualan 💸</div>'; return; }
-  let totalSell=0, totalProfit=0;
-  const rows = data.map(c => {
-    const profit = (c.sell_price_usd||0) - (c.buy_price_usd||0);
-    totalSell += (c.sell_price_usd||0); totalProfit += profit;
-    return `<tr>
-      <td style="font-weight:600">${c.card_name}</td>
-      <td class="text-right" style="color:var(--pk-gold)">${fmt(c.sell_price_usd)}</td>
-      <td class="text-right c-muted">${fmt(c.buy_price_usd)}</td>
-      <td class="text-right ${profit>=0?'pos':'neg'}">${profit>=0?'+':''}${fmt(profit)}</td>
-      <td class="c-muted" style="font-size:.75rem">${(c.sold_at||'').slice(0,10)||'—'}</td>
-    </tr>`;
-  }).join('');
-  $('trades-wrap').innerHTML = `<div style="overflow-x:auto"><table class="pk-table">
-    <thead><tr><th>Kartu</th><th class="text-right">Jual</th><th class="text-right">Beli</th><th class="text-right">Profit</th><th>Tgl</th></tr></thead>
-    <tbody>${rows}</tbody>
-    <tfoot><tr style="border-top:2px solid var(--pk-border)">
-      <td class="c-muted">Total ${data.length} transaksi</td>
-      <td class="text-right" style="font-weight:700;color:var(--pk-gold)">${fmt(totalSell)}</td>
-      <td></td>
-      <td class="text-right ${totalProfit>=0?'pos':'neg'}" style="font-weight:700">${totalProfit>=0?'+':''}${fmt(totalProfit)}</td>
-      <td></td>
-    </tr></tfoot>
-  </table></div>`;
-}
-
-// ── Wishlist Tab ──────────────────────────────────────────────────────────────
-async function loadWishlist() {
-  const p = q();
-  const data = await fetch('/api/wishlist?'+p).then(r=>r.json()).catch(()=>[]);
-  if (!data.length) { $('wish-wrap').innerHTML='<div class="spin-wrap">Wishlist kosong ⭐</div>'; return; }
-  const prioMap = {3:'🔴 Tinggi',2:'🟡 Sedang',1:'🟢 Rendah'};
-  const rows = data.map(c => `<tr>
-    <td style="font-weight:600">${c.card_name}
-      ${c.notes ? `<div class="c-muted" style="font-size:.72rem">📝 ${c.notes}</div>` : ''}
-    </td>
-    <td class="c-muted" style="font-size:.75rem">${c.card_set||'—'}</td>
-    <td class="text-right" style="color:var(--pk-gold)">${c.target_price_usd ? fmt(c.target_price_usd) : '—'}</td>
-    <td><span class="badge-priority">${prioMap[c.priority]||'—'}</span></td>
-    <td class="c-muted" style="font-size:.72rem">${(c.added_at||'').slice(0,10)||'—'}</td>
-  </tr>`).join('');
-  $('wish-wrap').innerHTML = `<div style="overflow-x:auto"><table class="pk-table">
-    <thead><tr><th>Kartu</th><th>Set</th><th class="text-right">Target</th><th>Prioritas</th><th>Tgl</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table></div>`;
-}
-
-// ── Tab Switch ────────────────────────────────────────────────────────────────
-document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    activeTab = btn.dataset.tab;
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    ['overview','collection','forsale','trades','wishlist'].forEach(t => {
-      $('tab-'+t).classList.toggle('d-none', t !== activeTab);
-    });
-    if (activeTab === 'collection') { loadSetsList(); doSearch(1); }
-    if (activeTab === 'forsale')    loadForSale();
-    if (activeTab === 'trades')     loadTrades();
-    if (activeTab === 'wishlist')   loadWishlist();
+// ── Set doughnut ──────────────────────────────────────────────────────
+function drawSetChart(data) {
+  if (!data.length) return;
+  const top = data.slice(0, 8);
+  const colors = ['#4361ee','#3a0ca3','#7209b7','#e63946','#f4a261','#2dc653','#38b2ac','#ed8936'];
+  const ctx = document.getElementById('setChart');
+  if (setChart) setChart.destroy();
+  setChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: top.map(d => d.card_set || 'Unknown'),
+      datasets: [{ data: top.map(d => d.total_usd.toFixed(2)), backgroundColor: colors, borderWidth: 2 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      plugins: {
+        legend: {
+          position: 'right',
+          labels: { color: chartColors().text, font: { size: 11 }, padding: 12 }
+        },
+        tooltip: { callbacks: { label: ctx => ' $' + ctx.raw } }
+      }
+    }
   });
-});
-
-// ── Load All ──────────────────────────────────────────────────────────────────
-async function loadAll() {
-  loadStats();
-  if (activeTab === 'overview') {
-    loadPortfolioChart(); loadConditionChart(); loadSetsChart(); loadTopCards();
-  } else if (activeTab === 'collection') {
-    loadSetsList(); doSearch(curPage);
-  } else if (activeTab === 'forsale')  loadForSale();
-  else if (activeTab === 'trades')    loadTrades();
-  else if (activeTab === 'wishlist')  loadWishlist();
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-(async () => {
-  await loadUsers();
-  await loadAll();
-  setInterval(loadAll, 60000); // auto-refresh 60s
-})();
+// ── Condition pie ─────────────────────────────────────────────────────
+function drawCondChart(data) {
+  if (!data.length) return;
+  const condColor = {
+    'Mint': '#2dc653', 'Near Mint': '#4361ee',
+    'Lightly Played': '#38b2ac', 'Moderately Played': '#f4a261',
+    'Heavily Played': '#e63946', 'Damaged': '#7209b7',
+  };
+  const ctx = document.getElementById('condChart');
+  if (condChart) condChart.destroy();
+  condChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: data.map(d => d.condition),
+      datasets: [{
+        data: data.map(d => d.cnt),
+        backgroundColor: data.map(d => condColor[d.condition] || '#8a92b0'),
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      plugins: {
+        legend: {
+          position: 'right',
+          labels: { color: chartColors().text, font: { size: 11 }, padding: 12 }
+        }
+      }
+    }
+  });
+}
+
+function redrawCharts() {
+  if (portfolioChart) {
+    const days = document.querySelector('#page-dashboard select')?.value || 30;
+    loadPortfolioChart(days);
+  }
+  // Redraw set/cond
+  if (setChart) {
+    api('/api/by-set').then(drawSetChart);
+    api('/api/by-condition').then(drawCondChart);
+  }
+}
+
+// ── Inventory ─────────────────────────────────────────────────────────
+async function loadInventory() {
+  const data = await api('/api/inventory');
+  inv = data;
+  // Populate set filter
+  const sets = [...new Set(data.map(d => d.card_set).filter(Boolean))].sort();
+  const sf = document.getElementById('inv-filter-set');
+  sf.innerHTML = '<option value="">Semua Set</option>' +
+    sets.map(s => `<option>${esc(s)}</option>`).join('');
+  const folders = [...new Set(data.map(d => d.folder).filter(Boolean))].sort();
+  const ff = document.getElementById('inv-filter-folder');
+  ff.innerHTML = '<option value="">Semua Folder</option>' +
+    folders.map(f => `<option>${esc(f)}</option>`).join('');
+  filterInventory();
+}
+
+function filterInventory() {
+  const q    = document.getElementById('inv-search').value.toLowerCase();
+  const set  = document.getElementById('inv-filter-set').value;
+  const cond = document.getElementById('inv-filter-cond').value;
+  const fold = document.getElementById('inv-filter-folder').value;
+  invFiltered = inv.filter(c => {
+    if (q    && !c.card_name.toLowerCase().includes(q) &&
+               !(c.card_set||'').toLowerCase().includes(q)) return false;
+    if (set  && c.card_set !== set) return false;
+    if (cond && c.condition !== cond) return false;
+    if (fold && c.folder !== fold) return false;
+    return true;
+  });
+  sortApply();
+  invPage = 1;
+  renderInvTable();
+}
+
+function sortTable(tbl, col) {
+  if (tbl === 'inv') {
+    if (invSort.col === col) invSort.dir = invSort.dir === 'asc' ? 'desc' : 'asc';
+    else { invSort.col = col; invSort.dir = 'desc'; }
+    sortApply();
+    renderInvTable();
+  }
+}
+
+function sortApply() {
+  const { col, dir } = invSort;
+  invFiltered.sort((a,b) => {
+    let va = a[col], vb = b[col];
+    if (va == null) va = col === 'price_usd' ? 0 : '';
+    if (vb == null) vb = col === 'price_usd' ? 0 : '';
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va < vb) return dir === 'asc' ? -1 : 1;
+    if (va > vb) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+  document.querySelectorAll('#inv-table thead th').forEach(th => {
+    th.classList.remove('sort-asc','sort-desc');
+  });
+  const headers = document.querySelectorAll('#inv-table thead th');
+  const cols = ['card_name','card_set','condition','psa_grade','price_usd','buy_price_usd','pnl','folder'];
+  const idx = cols.indexOf(col);
+  if (idx >= 0) headers[idx].classList.add('sort-' + invSort.dir);
+}
+
+function renderInvTable() {
+  const total = invFiltered.length;
+  const pages = Math.ceil(total / invPerPage) || 1;
+  if (invPage > pages) invPage = pages;
+  const start = (invPage - 1) * invPerPage;
+  const slice = invFiltered.slice(start, start + invPerPage);
+
+  document.getElementById('inv-tbody').innerHTML = slice.map((c, i) => {
+    const pnl = (c.price_usd || 0) - (c.buy_price_usd || 0);
+    const pnlCls = pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : 'pnl-zero';
+    const pnlStr = pnl === 0 ? '—' : (pnl > 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    const cond = c.condition || 'Near Mint';
+    const condBadge = {
+      'Mint':'badge-green','Near Mint':'badge-blue','Lightly Played':'badge-yellow',
+      'Moderately Played':'badge-yellow','Heavily Played':'badge-red','Damaged':'badge-red'
+    }[cond] || 'badge-gray';
+    return `<tr>
+      <td><a class="td-name" style="max-width:200px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+           onclick="openCardModal(${c.id},'${esc(c.card_name)}')"
+           href="javascript:void(0)">${esc(c.card_name)}</a>
+           ${c.for_sale ? '<span class="for-sale-dot" title="For Sale"></span>' : ''}</td>
+      <td class="td-set">${esc(c.card_set||'—')}</td>
+      <td><span class="badge ${condBadge}">${cond}</span></td>
+      <td class="td-num">${c.psa_grade ? `<span class="grade-pill">${esc(c.psa_grade)}</span>` : '<span class="text-muted">—</span>'}</td>
+      <td class="td-num">$${(c.price_usd||0).toFixed(2)}</td>
+      <td class="td-num">${c.buy_price_usd ? '$'+c.buy_price_usd.toFixed(2) : '<span class="text-muted">—</span>'}</td>
+      <td class="td-num ${pnlCls}">${pnlStr}</td>
+      <td><span class="badge badge-gray">${esc(c.folder||'Pribadi')}</span></td>
+      <td><a href="javascript:void(0)" onclick="openCardModal(${c.id},'${esc(c.card_name)}')" style="font-size:11px;color:var(--accent)">📊</a></td>
+    </tr>`;
+  }).join('');
+
+  // Pagination
+  const pag = document.getElementById('inv-pag');
+  pag.innerHTML = `
+    <span>${total} kartu${total !== inv.length ? ' (filter)' : ''} &nbsp;·&nbsp; Halaman ${invPage} dari ${pages}</span>
+    <div class="pag-btns">
+      <button class="pag-btn" onclick="changePage(-1)" ${invPage<=1?'disabled':''}>‹ Prev</button>
+      ${Array.from({length: Math.min(pages,7)}, (_,k) => {
+        const p = invPage <= 4 ? k+1 : invPage - 3 + k;
+        if (p < 1 || p > pages) return '';
+        return `<button class="pag-btn${p===invPage?' active':''}" onclick="gotoPage(${p})">${p}</button>`;
+      }).join('')}
+      <button class="pag-btn" onclick="changePage(1)" ${invPage>=pages?'disabled':''}>Next ›</button>
+    </div>
+  `;
+}
+function changePage(d) { invPage = Math.max(1, Math.min(Math.ceil(invFiltered.length/invPerPage), invPage+d)); renderInvTable(); }
+function gotoPage(p) { invPage = p; renderInvTable(); }
+
+// ── Card modal ─────────────────────────────────────────────────────────
+async function openCardModal(id, name) {
+  document.getElementById('modal-card-name').textContent = name;
+  document.getElementById('modal-stats').innerHTML = '<div class="text-muted">Loading…</div>';
+  document.getElementById('modal-hist-tbody').innerHTML = '';
+  document.getElementById('modal-overlay').classList.add('open');
+
+  const [details, hist] = await Promise.all([
+    api('/api/card/' + id),
+    api('/api/price-history?name=' + encodeURIComponent(name)),
+  ]);
+
+  // Stats
+  const pnl = (details.price_usd||0) - (details.buy_price_usd||0);
+  const pnlPct = details.buy_price_usd > 0 ? (pnl/details.buy_price_usd*100).toFixed(1) : 0;
+  document.getElementById('modal-stats').innerHTML = `
+    <div class="stat-card"><div class="stat-label">Harga Pasar</div><div class="stat-value blue">$${(details.price_usd||0).toFixed(2)}</div></div>
+    <div class="stat-card"><div class="stat-label">Harga Beli</div><div class="stat-value">${details.buy_price_usd?'$'+details.buy_price_usd.toFixed(2):'—'}</div></div>
+    <div class="stat-card"><div class="stat-label">P&L</div><div class="stat-value ${pnl>=0?'green':'red'}">${pnl>=0?'+':''}$${pnl.toFixed(2)} <span style="font-size:14px">(${pnlPct}%)</span></div></div>
+    <div class="stat-card"><div class="stat-label">Kondisi</div><div class="stat-value" style="font-size:16px">${details.condition||'—'}</div></div>
+  `;
+
+  // History table
+  document.getElementById('modal-hist-tbody').innerHTML = hist.map(h => `
+    <tr>
+      <td>${h.recorded_at.slice(0,16).replace('T',' ')}</td>
+      <td class="td-num">$${(h.price_usd||0).toFixed(2)}</td>
+      <td class="td-num">Rp ${Math.round((h.price_usd||0)*EXRATE).toLocaleString('id-ID')}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="3" class="text-muted" style="padding:16px;text-align:center">Belum ada riwayat harga</td></tr>';
+
+  // Chart
+  const ctx = document.getElementById('priceHistChart');
+  if (priceHistChart) priceHistChart.destroy();
+  if (hist.length > 0) {
+    const c = chartColors();
+    priceHistChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: hist.map(h => h.recorded_at.slice(0,10)),
+        datasets: [{
+          label: 'USD',
+          data: hist.map(h => h.price_usd),
+          borderColor: c.line,
+          borderWidth: 2,
+          tension: 0.3,
+          fill: false,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => ' $' + ctx.parsed.y.toFixed(2) } }
+        },
+        scales: {
+          x: { grid: { color: c.grid }, ticks: { color: c.text, font: { size: 11 } } },
+          y: { grid: { color: c.grid }, ticks: { color: c.text, font: { size: 11 },
+               callback: v => '$' + v.toFixed(2) } }
+        }
+      }
+    });
+  }
+}
+
+function closeModal(e) {
+  if (e.target.id === 'modal-overlay')
+    document.getElementById('modal-overlay').classList.remove('open');
+}
+
+// ── Wishlist ──────────────────────────────────────────────────────────
+async function loadWishlist() {
+  const data = await api('/api/wishlist');
+  document.getElementById('wish-tbody').innerHTML = data.map((w,i) => {
+    const gap = w.target_price_usd > 0 ? (w.price_usd - w.target_price_usd) : null;
+    const gapStr = gap === null ? '—' : (gap <= 0
+      ? `<span class="badge badge-green">On Target!</span>`
+      : `<span class="pnl-neg">-$${gap.toFixed(2)}</span>`);
+    return `<tr>
+      <td class="text-muted">${i+1}</td>
+      <td class="td-name">${esc(w.card_name)}</td>
+      <td class="td-set">${esc(w.card_set||'—')}</td>
+      <td class="td-num">$${(w.price_usd||0).toFixed(2)}</td>
+      <td class="td-num">${w.target_price_usd ? '$'+w.target_price_usd.toFixed(2) : '—'}</td>
+      <td class="td-num">${gapStr}</td>
+      <td class="text-muted text-sm">${(w.added_at||'').slice(0,10)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="7"><div class="empty"><div class="icon">🌟</div><p>Wishlist kosong</p></div></td></tr>';
+}
+
+// ── Graded ────────────────────────────────────────────────────────────
+async function loadGraded() {
+  const data = await api('/api/graded');
+  document.getElementById('graded-tbody').innerHTML = data.map(c => {
+    const ref = c.grade_ref_price;
+    const cur = c.price_usd || 0;
+    let chg = '';
+    if (ref && ref > 0) {
+      const pct = ((cur - ref) / ref * 100);
+      chg = `<span class="${pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%</span>`;
+    }
+    return `<tr>
+      <td class="td-name">${esc(c.card_name)}</td>
+      <td class="td-set">${esc(c.card_set||'—')}</td>
+      <td class="td-num"><span class="grade-pill">${esc(c.psa_grade)}</span></td>
+      <td class="td-num">$${cur.toFixed(2)}</td>
+      <td class="td-num">${ref ? '$'+ref.toFixed(2) : '<span class="text-muted">—</span>'}</td>
+      <td class="td-num">${chg || '<span class="text-muted">—</span>'}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="6"><div class="empty"><div class="icon">🏆</div><p>Belum ada kartu graded</p></div></td></tr>';
+}
+
+// ── Trade offers ──────────────────────────────────────────────────────
+async function loadTrade() {
+  const data = await api('/api/trade-offers');
+  document.getElementById('trade-tbody').innerHTML = data.map(t => `
+    <tr>
+      <td>${esc(t.username || 'User '+t.user_id)}</td>
+      <td><span class="badge badge-blue">${esc(t.card_name_have)}</span></td>
+      <td><span class="badge badge-yellow">${esc(t.card_name_want)}</span></td>
+      <td><span class="badge ${t.status==='open'?'badge-green':'badge-gray'}">${t.status}</span></td>
+      <td class="text-sm text-muted">${(t.created_at||'').slice(0,10)}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="5"><div class="empty"><div class="icon">🔄</div><p>Belum ada trade offer</p></div></td></tr>';
+}
+
+// ── Sold history ──────────────────────────────────────────────────────
+async function loadSold() {
+  const data = await api('/api/sold');
+  let totalRev = 0, totalProfit = 0;
+  const rows = data.map(s => {
+    totalRev    += s.sell_price_usd || 0;
+    totalProfit += s.profit_usd     || 0;
+    const pCls = (s.profit_usd||0) >= 0 ? 'pnl-pos' : 'pnl-neg';
+    return `<tr>
+      <td class="td-name">${esc(s.card_name)}</td>
+      <td class="td-set">${esc(s.card_set||'—')}</td>
+      <td class="td-num">$${(s.sell_price_usd||0).toFixed(2)}</td>
+      <td class="td-num">$${(s.buy_price_usd||0).toFixed(2)}</td>
+      <td class="td-num ${pCls}">${(s.profit_usd||0)>=0?'+':''}$${(s.profit_usd||0).toFixed(2)}</td>
+      <td class="text-sm text-muted">${(s.sold_at||'').slice(0,10)}</td>
+    </tr>`;
+  });
+  document.getElementById('sold-count').textContent  = data.length;
+  document.getElementById('sold-rev').textContent    = '$' + totalRev.toFixed(2);
+  const profEl = document.getElementById('sold-profit');
+  profEl.textContent = (totalProfit >= 0 ? '+$' : '-$') + Math.abs(totalProfit).toFixed(2);
+  profEl.className = 'stat-value ' + (totalProfit >= 0 ? 'green' : 'red');
+  document.getElementById('sold-tbody').innerHTML = rows.join('') ||
+    '<tr><td colspan="6"><div class="empty"><div class="icon">💸</div><p>Belum ada kartu terjual</p></div></td></tr>';
+}
+
+// ── Escape HTML ──────────────────────────────────────────────────────
+function esc(s) {
+  if (!s && s !== 0) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────
+initDashboard();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
-# ─── Entry Point ──────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(HTML, exchange_rate=EXCHANGE_RATE)
+
+
+@app.route("/api/stats")
+def api_stats():
+    inv = q("""
+        SELECT price_usd, buy_price_usd, psa_grade, for_sale, card_set
+        FROM inventory
+    """)
+    total_market = sum(r["price_usd"] or 0 for r in inv)
+    total_buy    = sum(r["buy_price_usd"] or 0 for r in inv)
+    graded       = sum(1 for r in inv if r["psa_grade"])
+    for_sale     = sum(1 for r in inv if r["for_sale"])
+    sets         = len({r["card_set"] for r in inv if r["card_set"]})
+
+    wish = q("SELECT COUNT(*) as c FROM wishlist")
+    wish_count = wish[0]["c"] if wish else 0
+
+    trade = q("SELECT COUNT(*) as c FROM trade_offers WHERE status='open'")
+    trade_count = trade[0]["c"] if trade else 0
+
+    sold = q("SELECT COUNT(*) as c FROM trade_log")
+    sold_count = sold[0]["c"] if sold else 0
+
+    return jsonify(
+        total_market_usd=round(total_market, 2),
+        total_buy_usd   =round(total_buy, 2),
+        card_count      =len(inv),
+        set_count       =sets,
+        graded_count    =graded,
+        for_sale_count  =for_sale,
+        wishlist_count  =wish_count,
+        trade_count     =trade_count,
+        sold_count      =sold_count,
+    )
+
+
+@app.route("/api/top10")
+def api_top10():
+    rows = q("""
+        SELECT card_name, card_set, price_usd
+        FROM inventory
+        ORDER BY price_usd DESC
+        LIMIT 10
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/inventory")
+def api_inventory():
+    rows = q("""
+        SELECT id, card_name, card_set, price_usd, price_idr,
+               condition, psa_grade, buy_price_usd, for_sale,
+               ask_price_usd, folder, tags, notes, grade_ref_price
+        FROM inventory
+        ORDER BY price_usd DESC
+    """)
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["pnl"] = (d.get("price_usd") or 0) - (d.get("buy_price_usd") or 0)
+        result.append(d)
+    return jsonify(result)
+
+
+@app.route("/api/card/<int:card_id>")
+def api_card(card_id):
+    row = q1("""
+        SELECT id, card_name, card_set, price_usd, price_idr,
+               condition, psa_grade, buy_price_usd, for_sale,
+               ask_price_usd, folder, tags, notes, grade_ref_price
+        FROM inventory WHERE id = ?
+    """, (card_id,))
+    if row is None:
+        return jsonify({}), 404
+    return jsonify(dict(row))
+
+
+@app.route("/api/price-history")
+def api_price_history():
+    name = request.args.get("name", "")
+    rows = q("""
+        SELECT price_usd, price_idr, recorded_at
+        FROM price_history
+        WHERE LOWER(card_name) = LOWER(?)
+        ORDER BY recorded_at ASC
+        LIMIT 200
+    """, (name,))
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/portfolio-history")
+def api_portfolio_history():
+    days = int(request.args.get("days", 30))
+    if days > 0:
+        rows = q("""
+            SELECT date(snapped_at) as date, SUM(total_usd) as total_usd
+            FROM portfolio_snapshots
+            WHERE snapped_at >= date('now', ? || ' days')
+            GROUP BY date(snapped_at)
+            ORDER BY date ASC
+        """, (f"-{days}",))
+    else:
+        rows = q("""
+            SELECT date(snapped_at) as date, SUM(total_usd) as total_usd
+            FROM portfolio_snapshots
+            GROUP BY date(snapped_at)
+            ORDER BY date ASC
+        """)
+    # If empty, return today's value as single point
+    if not rows:
+        total = q1("SELECT COALESCE(SUM(price_usd),0) as t FROM inventory")
+        today = datetime.now().strftime("%Y-%m-%d")
+        return jsonify([{"date": today, "total_usd": round(total["t"], 2)}])
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/by-set")
+def api_by_set():
+    rows = q("""
+        SELECT COALESCE(card_set,'Unknown') as card_set,
+               SUM(price_usd) as total_usd,
+               COUNT(*) as cnt
+        FROM inventory
+        GROUP BY card_set
+        ORDER BY total_usd DESC
+        LIMIT 10
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/by-condition")
+def api_by_condition():
+    rows = q("""
+        SELECT COALESCE(condition,'Near Mint') as condition,
+               COUNT(*) as cnt
+        FROM inventory
+        GROUP BY condition
+        ORDER BY cnt DESC
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/wishlist")
+def api_wishlist():
+    rows = q("""
+        SELECT id, card_name, card_set, price_usd, price_idr,
+               target_price_usd, added_at
+        FROM wishlist
+        ORDER BY price_usd DESC
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/graded")
+def api_graded():
+    rows = q("""
+        SELECT card_name, card_set, psa_grade, price_usd, grade_ref_price
+        FROM inventory
+        WHERE psa_grade IS NOT NULL AND psa_grade != ''
+        ORDER BY price_usd DESC
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/trade-offers")
+def api_trade_offers():
+    rows = q("""
+        SELECT id, user_id, username, card_name_have, card_name_want, status, created_at
+        FROM trade_offers
+        ORDER BY created_at DESC
+        LIMIT 100
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/sold")
+def api_sold():
+    rows = q("""
+        SELECT card_name, card_set, sell_price_usd, buy_price_usd, profit_usd, sold_at
+        FROM trade_log
+        ORDER BY sold_at DESC
+    """)
+    return jsonify([dict(r) for r in rows])
+
+
+# ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    db_status = "✅ ditemukan" if os.path.exists(DB_PATH) else "❌ TIDAK ditemukan"
     print(f"""
-╔════════════════════════════════════════╗
-║  🎴  PokeDex Price — Web Dashboard    ║
-╚════════════════════════════════════════╝
-  Database : {DB_PATH}
-             {db_status}
-  Rate     : Rp {RATE:,} / USD
-  Port     : {PORT}
-
-  Buka di browser HP  : http://localhost:{PORT}
-  Dari HP lain (WiFi) : http://<IP-lokal>:{PORT}
-  Cari IP lokal       : ip addr | grep 192
-
-  Tekan Ctrl+C untuk stop.
+╔══════════════════════════════════════════════╗
+║       PokéDex Price Dashboard  🎴            ║
+╠══════════════════════════════════════════════╣
+║  URL   : http://localhost:{PORT}              ║
+║  DB    : {DB_PATH:<38}║
+║  Rate  : 1 USD = Rp {EXCHANGE_RATE:,}               ║
+╠══════════════════════════════════════════════╣
+║  Cloudflare Tunnel:                          ║
+║  cloudflared tunnel --url http://localhost:{PORT} ║
+╚══════════════════════════════════════════════╝
 """)
-    if not os.path.exists(DB_PATH):
-        print("  ⚠️  Database tidak ditemukan! Coba:")
-        print("  DB_PATH=/path/ke/pokedex.db python3 dashboard.py")
-        print("  Atau cari dengan: find ~ -name 'pokedex.db' 2>/dev/null\n")
-
     app.run(host="0.0.0.0", port=PORT, debug=False)
