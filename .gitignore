@@ -1,6 +1,6 @@
-.env
 *.db
+.env
 __pycache__/
 *.pyc
-*.pyo
-.DS_Store
+bot.log
+nohup.out
