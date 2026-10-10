@@ -1502,7 +1502,7 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
         usd_str   = esc_usd(p_usd)   if (p_usd  or 0) > 0 else "N/A"
         idr_str   = f"Rp {p_idr:,.0f}" if (p_idr or 0) > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
-        grade_str = f"🏆 PSA {esc(str(psa_grade))} · " if psa_grade else ""
+        grade_str = f"🏆 {esc(str(psa_grade))} · " if psa_grade else ""
         photo_str = f" · 📷 /photo {global_idx}" if photo_file_id else ""
         set_line  = f"   _{esc(card_set)}_\n" if card_set else ""
         sale_str  = f"\n   🏷️ Ask: _{esc_usd(ask_price or 0)}_" if for_sale else ""
