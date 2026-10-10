@@ -317,6 +317,18 @@ async def init_db() -> None:
 
         await db.commit()
 
+# ── Helper: resolve inventory position (1-based) → actual DB id ──────────────
+async def resolve_card_pos(user_id: int, pos: int) -> int | None:
+    """Convert 1-based nomor urut /inventory ke real DB id.
+    Return None kalau posisi out-of-range."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM inventory WHERE user_id=? ORDER BY id LIMIT 1 OFFSET ?",
+            (user_id, pos - 1),
+        ) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else None
+
 # ── Helper: get user language ─────────────────────────────────────────────────
 async def get_user_lang(user_id: int) -> str:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1491,7 +1503,7 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
         idr_str   = f"Rp {p_idr:,.0f}" if (p_idr or 0) > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
         grade_str = f" \\| 🏆 {esc(str(psa_grade))}" if psa_grade else ""
-        photo_str = f" \\| 📷 /photo {inv_id}" if photo_file_id else ""
+        photo_str = f" \\| 📷 /photo {global_idx}" if photo_file_id else ""
         set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
         sale_str  = f" \\| 🏷️ _{esc_usd(ask_price or 0)}_" if for_sale else ""
 
@@ -1502,7 +1514,7 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
             mid_rows += f"   ├ 📝 _{esc(notes)}_\n"
 
         lines.append(
-            f"{global_idx}\\. *{esc(name)}*{set_str} — `\\#{inv_id}`\n"
+            f"{global_idx}\\. *{esc(name)}*{set_str} — `\\#{global_idx}`\n"
             f"{mid_rows}"
             f"   └ 💵 {usd_str} \\| {idr_str}{sale_str}\n"
         )
@@ -1564,14 +1576,18 @@ async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "Format: `/photo \\<id\\>`\n_Contoh: `/photo 3`_\n\nID bisa dilihat di /inventory",
+            "Format: `/photo \\<nomor\\>`\n_Contoh: `/photo 3`_\n\nNomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -1586,8 +1602,8 @@ async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not photo_file_id and not photo_file_id_back:
         await update.message.reply_text(
             f"📷 *{esc(card_name)}* belum punya foto tersimpan bre\\.\n"
-            f"_Tambah foto depan: /setphoto {card_id}_\n"
-            f"_Tambah foto belakang: /setphoto2 {card_id}_",
+            f"_Tambah foto depan: /setphoto {pos}_\n"
+            f"_Tambah foto belakang: /setphoto2 {pos}_",
             parse_mode="MarkdownV2",
         )
         return
@@ -1597,10 +1613,9 @@ async def show_card_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         + (f"\n💵 {esc_usd(price_usd)}" if price_usd and price_usd > 0 else "")
     )
     if photo_file_id:
-        has_back = " \\| _/photo2 {card_id} untuk belakang_" if photo_file_id_back else ""
         await update.message.reply_photo(
             photo=photo_file_id,
-            caption=caption + (f"\n_Foto belakang: /photo2 {card_id}_" if photo_file_id_back else ""),
+            caption=caption + (f"\n_Foto belakang: /photo2 {pos}_" if photo_file_id_back else ""),
             parse_mode="MarkdownV2",
         )
     elif photo_file_id_back:
@@ -3674,18 +3689,23 @@ async def set_buyprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text(
-            "⚠️ Format: `/buyprice \\<id\\> \\<harga_usd\\>`\n"
+            "⚠️ Format: `/buyprice \\<nomor\\> \\<harga_usd\\>`\n"
             "Contoh: `/buyprice 3 12\\.5`\n"
-            "_Lihat ID kartu di /inventory_",
+            "_Lihat nomor kartu di /inventory_",
             parse_mode="MarkdownV2",
         )
         return
 
     try:
-        card_id   = int(context.args[0])
+        pos       = int(context.args[0])
         buy_price = float(context.args[1])
     except ValueError:
-        await update.message.reply_text("⚠️ ID dan harga harus berupa angka\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor dan harga harus berupa angka\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("❌ Kartu tidak ditemukan di inventory kamu\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -3959,18 +3979,23 @@ async def jual_kartu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if len(context.args) < 2:
         await update.message.reply_text(
-            "⚠️ Format: `/jual \\<id\\> \\<harga\\_jual\\_usd\\>`\n"
+            "⚠️ Format: `/jual \\<nomor\\> \\<harga\\_jual\\_usd\\>`\n"
             "Contoh: `/jual 3 25\\.00`\n"
-            "_Lihat ID di /inventory — kartu akan DIHAPUS dari inventory_",
+            "_Lihat nomor di /inventory — kartu akan DIHAPUS dari inventory_",
             parse_mode="MarkdownV2",
         )
         return
 
     try:
-        card_id    = int(context.args[0])
+        pos        = int(context.args[0])
         sell_price = float(context.args[1])
     except ValueError:
-        await update.message.reply_text("⚠️ ID dan harga harus berupa angka\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor dan harga harus berupa angka\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("❌ Kartu tidak ditemukan di inventory kamu\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4579,14 +4604,19 @@ async def set_card_photo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "📸 Format: `/setphoto \\<id\\>`\n_Contoh: `/setphoto 4`_\n\nID bisa dilihat di /inventory",
+            "📸 Format: `/setphoto \\<nomor\\>`\n_Contoh: `/setphoto 4`_\n\nNomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4602,7 +4632,7 @@ async def set_card_photo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await set_ustate(user_id, "pending_setphoto_id", card_id)
     await update.message.reply_text(
-        f"📸 Siap update foto *{esc(row[0])}* \\(ID: \\#{card_id}\\)\\!\n\n"
+        f"📸 Siap update foto *{esc(row[0])}* \\(ID: \\#{pos}\\)\\!\n\n"
         f"Sekarang *kirim fotonya* bre 👇",
         parse_mode="MarkdownV2",
     )
@@ -4618,9 +4648,14 @@ async def editkartu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4641,7 +4676,7 @@ async def editkartu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         [InlineKeyboardButton("❌ Batal",       callback_data=f"editkartu_batal:{card_id}:{user_id}")],
     ])
     await update.message.reply_text(
-        f"✏️ *Edit Kartu \\#{card_id}*\n\n"
+        f"✏️ *Edit Kartu \\#{pos}*\n\n"
         f"🃏 Nama: *{esc(card_name)}*\n"
         f"💵 Harga: {esc_usd(price_usd)} \\| Rp {esc(f'{price_idr:,.0f}')}\n"
         f"🏷️ Kondisi: {esc(condition or 'Near Mint')}\n\n"
@@ -4740,17 +4775,22 @@ async def setalert_persen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_id = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text(
-            "⚠️ Format: `/setalert \\<id\\> \\<persen\\>`\n"
+            "⚠️ Format: `/setalert \\<nomor\\> \\<persen\\>`\n"
             "_Contoh: `/setalert 4 20` → notif kalau harga naik/turun 20% dari harga beli_\n\n"
-            "ID kartu bisa dilihat di /inventory",
+            "Nomor kartu bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
-        persen  = float(context.args[1])
+        pos    = int(context.args[0])
+        persen = float(context.args[1])
     except ValueError:
-        await update.message.reply_text("⚠️ ID dan persen harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor dan persen harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4768,7 +4808,7 @@ async def setalert_persen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not buy_price or buy_price <= 0:
         await update.message.reply_text(
             f"⚠️ Kartu *{esc(card_name)}* belum ada harga beli\\.\n"
-            f"Set dulu dengan `/buyprice {card_id} \\<harga\\_usd\\>`",
+            f"Set dulu dengan `/buyprice {pos} \\<harga\\_usd\\>`",
             parse_mode="MarkdownV2",
         )
         return
@@ -4885,14 +4925,19 @@ async def share_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "🎨 Format: `/share \\<id\\>`\n_Contoh: `/share 4`_\n\nID bisa dilihat di /inventory",
+            "🎨 Format: `/share \\<nomor\\>`\n_Contoh: `/share 4`_\n\nNomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -4943,14 +4988,18 @@ async def set_card_photo2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "📸 Format: `/setphoto2 \\<id\\>`\n_Contoh: `/setphoto2 4`_\n\nID bisa dilihat di /inventory",
+            "📸 Format: `/setphoto2 \\<nomor\\>`\n_Contoh: `/setphoto2 4`_\n\nNomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -4963,7 +5012,7 @@ async def set_card_photo2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await set_ustate(user_id, "pending_setphoto_back_id", card_id)
     await update.message.reply_text(
-        f"📸 Siap update *foto belakang* kartu *{esc(row[0])}* \\(ID: \\#{card_id}\\)\\!\n\n"
+        f"📸 Siap update *foto belakang* kartu *{esc(row[0])}* \\(ID: \\#{pos}\\)\\!\n\n"
         f"Sekarang *kirim fotonya* bre 👇",
         parse_mode="MarkdownV2",
     )
@@ -4974,14 +5023,18 @@ async def show_card_photo2(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "Format: `/photo2 \\<id\\>`\n_Contoh: `/photo2 3`_\n\nID bisa dilihat di /inventory",
+            "Format: `/photo2 \\<nomor\\>`\n_Contoh: `/photo2 3`_\n\nNomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -4996,7 +5049,7 @@ async def show_card_photo2(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not photo_back:
         await update.message.reply_text(
             f"📷 *{esc(card_name)}* belum punya foto belakang bre\\.\n"
-            f"_Tambah dengan: /setphoto2 {card_id}_",
+            f"_Tambah dengan: /setphoto2 {pos}_",
             parse_mode="MarkdownV2",
         )
         return
@@ -5183,17 +5236,22 @@ async def tag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text(
-            "🏷 Format: `/tag \\<id\\> \\<label\\>`\n"
+            "🏷 Format: `/tag \\<nomor\\> \\<label\\>`\n"
             "_Contoh: `/tag 4 favorit`_\n"
             "_Hapus tag: `/tag 4 hapus`_\n\n"
-            "ID bisa dilihat di /inventory",
+            "Nomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     label = " ".join(context.args[1:])
@@ -5214,7 +5272,7 @@ async def tag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await db.commit()
             await update.message.reply_text(
-                f"🗑️ Tag kartu *{esc(card_name)}* \\(\\#{card_id}\\) dihapus\\.",
+                f"🗑️ Tag kartu *{esc(card_name)}* \\(\\#{pos}\\) dihapus\\.",
                 parse_mode="MarkdownV2",
             )
         else:
@@ -5224,7 +5282,7 @@ async def tag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await db.commit()
             await update.message.reply_text(
-                f"🏷 Tag *\\#{esc(label)}* berhasil ditambahkan ke *{esc(card_name)}* \\(\\#{card_id}\\)\\!\n"
+                f"🏷 Tag *\\#{esc(label)}* berhasil ditambahkan ke *{esc(card_name)}* \\(\\#{pos}\\)\\!\n"
                 f"_Lihat di /inventory_",
                 parse_mode="MarkdownV2",
             )
@@ -5235,22 +5293,27 @@ async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_id = update.effective_user.id
     if len(context.args) < 2:
         await update.message.reply_text(
-            "⏰ Format: `/remind \\<id\\> \\<hari\\>`\n"
+            "⏰ Format: `/remind \\<nomor\\> \\<hari\\>`\n"
             "_Contoh: `/remind 4 7`_ \\(ingatkan 7 hari lagi\\)\n\n"
-            "ID bisa dilihat di /inventory",
+            "Nomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
-        days    = int(context.args[1])
+        pos  = int(context.args[0])
+        days = int(context.args[1])
         if days < 1 or days > 365:
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "⚠️ Format salah\\. Gunakan: `/remind \\<id\\> \\<hari\\>`\n_Hari harus 1–365_",
+            "⚠️ Format salah\\. Gunakan: `/remind \\<nomor\\> \\<hari\\>`\n_Hari harus 1–365_",
             parse_mode="MarkdownV2",
         )
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5322,14 +5385,19 @@ async def listing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_id = update.effective_user.id
     if not context.args:
         await update.message.reply_text(
-            "🛒 Format: `/listing \\<id\\>`\n_Contoh: `/listing 4`_\n\nID bisa dilihat di /inventory",
+            "🛒 Format: `/listing \\<nomor\\>`\n_Contoh: `/listing 4`_\n\nNomor bisa dilihat di /inventory",
             parse_mode="MarkdownV2",
         )
         return
     try:
-        card_id = int(context.args[0])
+        pos = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka bre\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka bre\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(user_id, pos)
+    if card_id is None:
+        await update.message.reply_text("⚠️ Kartu tidak ditemukan bre\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5691,9 +5759,14 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        card_id = int(args[0].lstrip('#'))
+        pos = int(args[0].lstrip('#'))
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(uid, pos)
+    if card_id is None:
+        await update.message.reply_text(f"⚠️ Kartu \\#{pos} tidak ditemukan\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5704,7 +5777,7 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             row = await cur.fetchone()
 
     if not row:
-        await update.message.reply_text(f"⚠️ Kartu \\#{card_id} tidak ditemukan\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text(f"⚠️ Kartu \\#{pos} tidak ditemukan\\.", parse_mode="MarkdownV2")
         return
 
     card_name, existing_note = row
@@ -5713,13 +5786,13 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Tampilkan catatan saat ini
         if existing_note:
             await update.message.reply_text(
-                f"📝 *Catatan {esc(card_name)}* `\\#{card_id}`:\n_{esc(existing_note)}_",
+                f"📝 *Catatan {esc(card_name)}* `\\#{pos}`:\n_{esc(existing_note)}_",
                 parse_mode="MarkdownV2"
             )
         else:
             await update.message.reply_text(
                 f"📝 *{esc(card_name)}* belum punya catatan\\.\n"
-                f"_Gunakan `/note {card_id} <teks>` untuk menambah\\._",
+                f"_Gunakan `/note {pos} <teks>` untuk menambah\\._",
                 parse_mode="MarkdownV2"
             )
         return
@@ -5733,7 +5806,7 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await db.commit()
             await update.message.reply_text(
-                f"🗑️ Catatan *{esc(card_name)}* `\\#{card_id}` dihapus\\.",
+                f"🗑️ Catatan *{esc(card_name)}* `\\#{pos}` dihapus\\.",
                 parse_mode="MarkdownV2"
             )
         else:
@@ -5742,7 +5815,7 @@ async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await db.commit()
             await update.message.reply_text(
-                f"📝 Catatan *{esc(card_name)}* `\\#{card_id}` disimpan:\n_{esc(teks)}_",
+                f"📝 Catatan *{esc(card_name)}* `\\#{pos}` disimpan:\n_{esc(teks)}_",
                 parse_mode="MarkdownV2"
             )
 
@@ -5754,21 +5827,26 @@ async def forsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if len(args) < 2:
         await update.message.reply_text(
-            "Gunakan: `/forsale <id> <harga_ask_USD>`\n"
+            "Gunakan: `/forsale <nomor> <harga_ask_USD>`\n"
             "_Contoh: `/forsale 5 25.00`_\n\n"
             "Tandai kartu sebagai mau dijual dengan harga ask\\.\n"
-            "Lihat semua: /salejual \\| Batal: /unsale \\<id\\>",
+            "Lihat semua: /salejual \\| Batal: /unsale \\<nomor\\>",
             parse_mode="MarkdownV2"
         )
         return
 
     try:
-        card_id   = int(args[0].lstrip('#'))
+        pos       = int(args[0].lstrip('#'))
         ask_price = float(args[1].replace(",", ""))
         if ask_price < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠️ Format: `/forsale <id> <harga>`", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Format: `/forsale <nomor> <harga>`", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(uid, pos)
+    if card_id is None:
+        await update.message.reply_text(f"⚠️ Kartu \\#{pos} tidak ditemukan\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5779,7 +5857,7 @@ async def forsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             row = await cur.fetchone()
 
     if not row:
-        await update.message.reply_text(f"⚠️ Kartu \\#{card_id} tidak ditemukan\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text(f"⚠️ Kartu \\#{pos} tidak ditemukan\\.", parse_mode="MarkdownV2")
         return
 
     card_name, card_set, price_usd, buy_usd = row
@@ -5796,29 +5874,34 @@ async def forsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     set_str = f" \\({esc(card_set)}\\)" if card_set else ""
     await update.message.reply_text(
-        f"🏷️ *{esc(card_name)}*{set_str} `\\#{card_id}` ditandai *FOR SALE*\\!\n\n"
+        f"🏷️ *{esc(card_name)}*{set_str} `\\#{pos}` ditandai *FOR SALE*\\!\n\n"
         f"Ask: *{esc_usd(ask_price)}* \\(Rp {ask_idr:,.0f}\\)\n"
         f"Harga beli: {esc_usd(buy_usd or price_usd or 0)}\n"
         f"Estimasi profit: *{sign_p}{esc(f'{profit:.2f}')} USD*\n\n"
         f"_/salejual — lihat semua kartu dijual_\n"
-        f"_/unsale {card_id} — batal jual_",
+        f"_/unsale {pos} — batal jual_",
         parse_mode="MarkdownV2"
     )
 
 
-# ── /unsale <id> — batalkan for-sale ─────────────────────────────────────────
+# ── /unsale <nomor> — batalkan for-sale ──────────────────────────────────────
 async def unsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid  = update.effective_user.id
     args = context.args
 
     if not args:
-        await update.message.reply_text("Gunakan: `/unsale <id>`", parse_mode="MarkdownV2")
+        await update.message.reply_text("Gunakan: `/unsale <nomor>`", parse_mode="MarkdownV2")
         return
 
     try:
-        card_id = int(args[0].lstrip('#'))
+        pos = int(args[0].lstrip('#'))
     except ValueError:
-        await update.message.reply_text("⚠️ ID harus angka\\.", parse_mode="MarkdownV2")
+        await update.message.reply_text("⚠️ Nomor harus angka\\.", parse_mode="MarkdownV2")
+        return
+
+    card_id = await resolve_card_pos(uid, pos)
+    if card_id is None:
+        await update.message.reply_text(f"⚠️ Kartu \\#{pos} tidak ditemukan\\.", parse_mode="MarkdownV2")
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5827,7 +5910,7 @@ async def unsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ) as cur:
             row = await cur.fetchone()
         if not row:
-            await update.message.reply_text(f"⚠️ Kartu \\#{card_id} tidak ditemukan\\.", parse_mode="MarkdownV2")
+            await update.message.reply_text(f"⚠️ Kartu \\#{pos} tidak ditemukan\\.", parse_mode="MarkdownV2")
             return
         await db.execute(
             "UPDATE inventory SET for_sale=0, ask_price_usd=0 WHERE id=? AND user_id=?",
@@ -5836,7 +5919,7 @@ async def unsale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await db.commit()
 
     await update.message.reply_text(
-        f"✅ *{esc(row[0])}* `\\#{card_id}` dikeluarkan dari daftar jual\\.",
+        f"✅ *{esc(row[0])}* `\\#{pos}` dikeluarkan dari daftar jual\\.",
         parse_mode="MarkdownV2"
     )
 
@@ -7866,16 +7949,23 @@ async def hargashopee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     card_set  = ""
 
     if raw.isdigit():
-        inv_id = int(raw)
+        pos    = int(raw)
+        inv_db = await resolve_card_pos(user_id, pos)
+        if inv_db is None:
+            await update.message.reply_text(
+                f"❌ Kartu \\#{pos} tidak ditemukan\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
                 "SELECT card_name, card_set FROM inventory WHERE id=? AND user_id=?",
-                (inv_id, user_id)
+                (inv_db, user_id)
             ) as cur:
                 row = await cur.fetchone()
         if not row:
             await update.message.reply_text(
-                f"❌ Kartu \\#{inv_id} tidak ditemukan\\.",
+                f"❌ Kartu \\#{pos} tidak ditemukan\\.",
                 parse_mode="MarkdownV2"
             )
             return
@@ -8161,16 +8251,23 @@ async def marketplace_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     grade_str = ""
 
     if raw.isdigit():
-        inv_id = int(raw)
+        pos    = int(raw)
+        inv_db = await resolve_card_pos(user_id, pos)
+        if inv_db is None:
+            await update.message.reply_text(
+                f"❌ Kartu \\#{pos} tidak ditemukan\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
                 "SELECT card_name, card_set, psa_grade FROM inventory WHERE id=? AND user_id=?",
-                (inv_id, user_id)
+                (inv_db, user_id)
             ) as cur:
                 row = await cur.fetchone()
         if not row:
             await update.message.reply_text(
-                f"❌ Kartu \\#{inv_id} tidak ditemukan\\.",
+                f"❌ Kartu \\#{pos} tidak ditemukan\\.",
                 parse_mode="MarkdownV2"
             )
             return
