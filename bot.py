@@ -284,6 +284,37 @@ async def init_db() -> None:
             except Exception:
                 pass
 
+        # ── v12 — trade offers, graded alert ref price, auto backup ──────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trade_offers (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                username        TEXT,
+                card_name_have  TEXT    NOT NULL,
+                card_name_want  TEXT    NOT NULL,
+                status          TEXT    DEFAULT 'open',
+                created_at      TEXT    DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_status ON trade_offers(status, user_id)"
+        )
+        for col, definition in [
+            ("grade_ref_price", "REAL DEFAULT NULL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE inventory ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
+        for col, definition in [
+            ("backupoto_enabled", "INTEGER DEFAULT 0"),
+            ("backupoto_chat_id", "INTEGER DEFAULT NULL"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE user_settings ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
+
         await db.commit()
 
 # ── Helper: get user language ─────────────────────────────────────────────────
@@ -799,7 +830,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• `/wish \\[nama\\]` → Tambah ke wishlist\n"
             "• `/wishlist` → Lihat wishlist\n"
             "• `/stats` → Statistik portfolio\n"
-            "• `/help` → Bantuan lengkap",
+            "• `/help` → Bantuan lengkap\n\n"
+            "🆕 *v12 \\— Fitur Baru:*\n"
+            "• `/bulkadd` → Tambah banyak kartu sekaligus\n"
+            "• `/tradeoffer` → Tawaran & cari trade\n"
+            "• `/tradematches` → Cari kecocokan trade\n"
+            "• `/setlengkap \\[set\\]` → Cek kelengkapan set\n"
+            "• `/gradedalert` → Alert harga kartu graded\n"
+            "• `/hargashopee \\[id\\]` → Cari di Shopee/Tokped\n"
+            "• `/marketplace \\[id\\]` → Link 6 marketplace\n"
+            "• `/backupoto on` → Auto backup mingguan",
             parse_mode="MarkdownV2",
         )
 
@@ -1360,6 +1400,22 @@ async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     user_id = update.effective_user.id
+
+    # ── Duplikat auto-warn ────────────────────────────────────────────────────
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM inventory WHERE user_id=? AND LOWER(card_name)=LOWER(?)",
+            (user_id, card["name"])
+        ) as cur:
+            dup_count = (await cur.fetchone())[0]
+
+    warn_str = ""
+    if dup_count > 0:
+        warn_str = (
+            f"\n\n⚠️ *Peringatan:* Kamu sudah punya *{dup_count}x* kartu ini di inventory\\!"
+            f"\n_Kartu tetap ditambahkan\\._"
+        )
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO inventory (user_id, card_name, card_set, price_usd, price_idr, condition) VALUES (?,?,?,?,?,?)",
@@ -1378,7 +1434,8 @@ async def add_inventory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"✅ *{esc(card['name'])}* ditambahkan\\!\n\n"
         f"📦 Set: {esc(card['set'])}\n"
         f"🏷️ Kondisi: Near Mint \\(default\\)\n"
-        f"💵 {price_str} \\| {idr_str}\n\n"
+        f"💵 {price_str} \\| {idr_str}"
+        f"{warn_str}\n\n"
         f"_Atur kondisi: /setcondition \\[no\\] \\[kondisi\\]_\n"
         f"_Atur grade: /setgrade \\[no\\] \\[grade\\]_",
         parse_mode="MarkdownV2",
@@ -1455,9 +1512,10 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
         lines.append(
             f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
             f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}* \\({total} kartu\\)\n\n"
-            f"_/note \\[id\\] \\[teks\\] • /forsale \\[id\\] \\[harga\\]_\n"
-            f"_/listing /tag /remind /share /setphoto /editkartu_\n"
-            f"_/setgrade \\[id\\] \\[grade\\] • /setcondition \\[id\\] \\[kondisi\\]_"
+            f"_/note \\[id\\] • /forsale \\[id\\] \\[harga\\] • /setgrade \\[id\\]_\n"
+            f"_/setcondition • /tag • /remind • /share • /setphoto_\n"
+            f"_/marketplace \\[id\\] • /hargashopee \\[id\\] • /bulkadd_\n"
+            f"_/tradeoffer • /setlengkap \\[nama set\\] • /gradedalert_"
         )
 
     return "\n".join(lines), page, total_pages, total
@@ -7328,6 +7386,856 @@ async def hitunggrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FITUR BARU v12
+# 1. /tradeoffer   — Trade matching system
+# 2. /gradedalert  — Alert harga kartu graded (>10% change)
+# 3. /setlengkap   — Set completion tracker
+# 4. /hargashopee  — Shopee/Tokopedia search links
+# 5. Duplikat auto-warn sudah ada di add_inventory
+# 6. /bulkadd      — Bulk add multiple cards
+# 7. /backupoto    — Weekly auto backup to Telegram
+# 8. /marketplace  — Marketplace search links (multi-platform)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── 1. /tradeoffer — Trade matching system ────────────────────────────────────
+async def tradeoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /tradeoffer <punya> → <mau>   — post tawaran trade baru
+    /tradeoffer                   — lihat semua tawaran aktif
+    """
+    user_id  = update.effective_user.id
+    username = (update.effective_user.username
+                or update.effective_user.first_name
+                or "anonim")
+
+    raw = " ".join(context.args).strip()
+
+    if not raw:
+        # ── tampilkan semua tawaran aktif ──────────────────────────────────
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """SELECT id, user_id, username, card_name_have, card_name_want, created_at
+                   FROM trade_offers WHERE status='open'
+                   ORDER BY created_at DESC LIMIT 20"""
+            ) as cur:
+                offers = await cur.fetchall()
+
+        if not offers:
+            await update.message.reply_text(
+                "📭 Belum ada tawaran trade aktif\\.\n\n"
+                "Post tawaran: `/tradeoffer Charizard → Pikachu`",
+                parse_mode="MarkdownV2"
+            )
+            return
+
+        lines = ["🔄 *Tawaran Trade Aktif:*\n"]
+        for oid, uid, uname, have, want, created in offers:
+            mine = "👤" if uid == user_id else "🤝"
+            lines.append(
+                f"{mine} `\\#{oid}` *{esc(have)}*\n"
+                f"   ↔️ Mau: *{esc(want)}*\n"
+                f"   Oleh: @{esc(str(uname or uid))}\n"
+            )
+        lines.append("_/myoffers \\| /tradematches \\| /removeoffer \\[id\\]_")
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        return
+
+    # ── parse format: have → want ──────────────────────────────────────────
+    sep = "→" if "→" in raw else ("->" if "->" in raw else None)
+    if sep is None:
+        await update.message.reply_text(
+            "⚠️ Format: `/tradeoffer Charizard → Pikachu`\n"
+            "Gunakan → atau \\-\\> sebagai pemisah\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    parts = raw.split(sep, 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        await update.message.reply_text(
+            "⚠️ Format: `/tradeoffer Charizard → Pikachu`",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    have = parts[0].strip()
+    want = parts[1].strip()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM inventory WHERE user_id=? AND LOWER(card_name) LIKE LOWER(?)",
+            (user_id, f"%{have}%")
+        ) as cur:
+            have_row = await cur.fetchone()
+
+        await db.execute(
+            """INSERT INTO trade_offers (user_id, username, card_name_have, card_name_want, status)
+               VALUES (?, ?, ?, ?, 'open')""",
+            (user_id, username, have, want)
+        )
+        await db.commit()
+
+    own_str = ("✅ \\(ada di inventorymu\\)" if have_row
+               else "⚠️ \\(tidak ada di inventory\\)")
+
+    await update.message.reply_text(
+        f"🔄 *Tawaran Trade Dipost\\!*\n\n"
+        f"🃏 Punya: *{esc(have)}* {own_str}\n"
+        f"🔮 Mau: *{esc(want)}*\n\n"
+        f"_Lihat tawaran: /tradeoffer_\n"
+        f"_Cari kecocokan: /tradematches_",
+        parse_mode="MarkdownV2"
+    )
+
+
+async def myoffers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lihat tawaran trade yang kamu post: /myoffers"""
+    user_id = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT id, card_name_have, card_name_want, created_at, status
+               FROM trade_offers WHERE user_id=? ORDER BY created_at DESC LIMIT 15""",
+            (user_id,)
+        ) as cur:
+            offers = await cur.fetchall()
+
+    if not offers:
+        await update.message.reply_text(
+            "📭 Kamu belum punya tawaran trade\\.\n"
+            "Post: `/tradeoffer Charizard → Pikachu`",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    lines = ["📋 *Tawaran Trademu:*\n"]
+    for oid, have, want, created, status in offers:
+        st_emoji = "🟢" if status == "open" else "🔴"
+        lines.append(
+            f"{st_emoji} `\\#{oid}` *{esc(have)}* ↔️ *{esc(want)}*\n"
+            f"   Status: {esc(status)} \\| {esc(str(created)[:10])}\n"
+        )
+    lines.append("_/removeoffer \\[id\\] untuk hapus_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+async def tradematches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cari tawaran yang cocok dengan inventory/wishlist kamu: /tradematches"""
+    user_id = update.effective_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT LOWER(card_name) FROM inventory WHERE user_id=?", (user_id,)
+        ) as cur:
+            my_inv = {r[0] for r in await cur.fetchall()}
+
+        async with db.execute(
+            "SELECT LOWER(card_name) FROM wishlist WHERE user_id=?", (user_id,)
+        ) as cur:
+            my_wish = {r[0] for r in await cur.fetchall()}
+
+        async with db.execute(
+            """SELECT id, user_id, username, card_name_have, card_name_want
+               FROM trade_offers WHERE user_id!=? AND status='open'""",
+            (user_id,)
+        ) as cur:
+            offers = await cur.fetchall()
+
+    matches = []
+    for oid, uid, uname, have, want in offers:
+        have_l = have.lower()
+        want_l = want.lower()
+        they_have_i_want = any(have_l in w or w in have_l for w in my_wish)
+        they_want_i_have = any(want_l in inv or inv in want_l for inv in my_inv)
+
+        if they_have_i_want and they_want_i_have:
+            match_type = "🎯 Match 2 arah"
+        elif they_have_i_want:
+            match_type = "💡 Mereka punya yg kamu mau"
+        elif they_want_i_have:
+            match_type = "🔔 Mereka mau yg kamu punya"
+        else:
+            continue
+        matches.append((match_type, oid, uname, have, want))
+
+    if not matches:
+        await update.message.reply_text(
+            "😔 Tidak ada kecocokan trade saat ini\\.\n\n"
+            "_Tambah wishlist: /wish \\[kartu\\]_\n"
+            "_Lihat semua tawaran: /tradeoffer_",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    lines = [f"🔄 *Trade Matches* \\({len(matches)} kecocokan\\):\n"]
+    for match_type, oid, uname, have, want in matches[:10]:
+        lines.append(
+            f"{match_type}\n"
+            f"   `\\#{oid}` @{esc(str(uname or '?'))} punya *{esc(have)}*\n"
+            f"   ↔️ mau *{esc(want)}*\n"
+        )
+    lines.append("_Hubungi langsung via Telegram_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+async def removeoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hapus tawaran trade: /removeoffer <id>"""
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("⚠️ Format: `/removeoffer 12`", parse_mode="MarkdownV2")
+        return
+    try:
+        oid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ ID harus angka\\.", parse_mode="MarkdownV2")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name_have, card_name_want FROM trade_offers WHERE id=? AND user_id=?",
+            (oid, user_id)
+        ) as cur:
+            offer = await cur.fetchone()
+
+        if not offer:
+            await update.message.reply_text(
+                f"❌ Tawaran \\#{oid} tidak ditemukan atau bukan punyamu\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
+
+        await db.execute("DELETE FROM trade_offers WHERE id=?", (oid,))
+        await db.commit()
+
+    await update.message.reply_text(
+        f"🗑️ Tawaran \\#{oid} \\(*{esc(offer[1])}* ↔️ *{esc(offer[2])}*\\) dihapus\\.",
+        parse_mode="MarkdownV2"
+    )
+
+
+# ── 2. /gradedalert — Alert harga kartu graded ────────────────────────────────
+async def gradedalert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /gradedalert      — lihat kartu graded + perubahan harga
+    /gradedalert set  — simpan harga sekarang sebagai referensi
+    """
+    user_id = update.effective_user.id
+    subcmd  = context.args[0].lower() if context.args else ""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT id, card_name, card_set, psa_grade, price_usd, grade_ref_price
+               FROM inventory
+               WHERE user_id=? AND psa_grade IS NOT NULL AND psa_grade != ''
+               ORDER BY price_usd DESC""",
+            (user_id,)
+        ) as cur:
+            graded = await cur.fetchall()
+
+    if not graded:
+        await update.message.reply_text(
+            "🏆 Kamu belum punya kartu graded\\!\n\n"
+            "_Gunakan /setgrade \\[id\\] untuk set grade kartu_",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    if subcmd == "set":
+        async with aiosqlite.connect(DB_PATH) as db:
+            for inv_id, *_, price_usd, _ in graded:
+                await db.execute(
+                    "UPDATE inventory SET grade_ref_price=? WHERE id=?",
+                    (price_usd, inv_id)
+                )
+            await db.commit()
+        await update.message.reply_text(
+            f"✅ *Harga Referensi Disimpan\\!*\n\n"
+            f"Harga saat ini dari *{len(graded)}* kartu graded dijadikan patokan\\.\n"
+            f"Bot akan cek perubahan >10% setiap hari\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # ── tampilkan status ──────────────────────────────────────────────────
+    lines = [f"🏆 *Kartu Graded Kamu* \\({len(graded)} kartu\\):\n"]
+    alert_count = 0
+
+    for inv_id, name, card_set, grade, price_usd, ref_price in graded:
+        if ref_price and ref_price > 0 and price_usd > 0:
+            change_pct = ((price_usd - ref_price) / ref_price) * 100
+            if abs(change_pct) >= 10:
+                alert_count += 1
+                arrow = "📈" if change_pct > 0 else "📉"
+                change_str = f"{arrow} *{abs(change_pct):.1f}%*"
+            else:
+                change_str = f"➡️ {change_pct:+.1f}%"
+            ref_str = f" \\(ref: {esc_usd(ref_price)}\\)"
+        else:
+            change_str = "⚪ belum ada referensi"
+            ref_str = ""
+
+        set_str = f" \\| {esc(card_set)}" if card_set else ""
+        lines.append(
+            f"🃏 *{esc(name)}*{set_str} — {esc(grade)}\n"
+            f"   💵 {esc_usd(price_usd)}{ref_str} {change_str}\n"
+        )
+
+    if alert_count > 0:
+        lines.append(f"\n⚠️ *{alert_count} kartu berubah >10%\\!*")
+
+    lines.append("\n_/gradedalert set — simpan harga referensi baru_")
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+async def check_graded_prices_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled: cek perubahan harga kartu graded >10%, notif user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT DISTINCT i.user_id,
+                      COALESCE(us.daily_chat_id, i.user_id) as chat_id
+               FROM inventory i
+               LEFT JOIN user_settings us ON us.user_id = i.user_id
+               WHERE i.psa_grade IS NOT NULL AND i.psa_grade != ''
+                 AND i.grade_ref_price IS NOT NULL AND i.grade_ref_price > 0"""
+        ) as cur:
+            users = await cur.fetchall()
+
+    for user_id, chat_id in users:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """SELECT card_name, psa_grade, price_usd, grade_ref_price
+                   FROM inventory
+                   WHERE user_id=? AND psa_grade IS NOT NULL
+                     AND grade_ref_price IS NOT NULL AND grade_ref_price > 0""",
+                (user_id,)
+            ) as cur:
+                graded = await cur.fetchall()
+
+        alerts = []
+        for name, grade, price_usd, ref_price in graded:
+            if price_usd > 0 and ref_price > 0:
+                change_pct = ((price_usd - ref_price) / ref_price) * 100
+                if abs(change_pct) >= 10:
+                    arrow = "📈" if change_pct > 0 else "📉"
+                    alerts.append(
+                        f"{arrow} *{esc(name)}* \\({esc(grade)}\\): {change_pct:+.1f}%"
+                    )
+
+        if alerts:
+            msg = (
+                "🏆 *Alert Harga Kartu Graded:*\n\n"
+                + "\n".join(alerts)
+                + "\n\n_/gradedalert untuk detail_"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=msg, parse_mode="MarkdownV2"
+                )
+            except Exception as e:
+                logger.error(f"[gradedalert_job] user {user_id}: {e}")
+
+
+# ── 3. /setlengkap — Set completion tracker ──────────────────────────────────
+async def setlengkap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /setlengkap <nama set>  — cek berapa kartu dari set itu yang kamu punya
+    """
+    user_id   = update.effective_user.id
+    query_str = " ".join(context.args).strip()
+
+    if not query_str:
+        await update.message.reply_text(
+            "⚠️ Format: `/setlengkap Scarlet \\& Violet`\n\n"
+            "Contoh:\n"
+            "`/setlengkap Base Set`\n"
+            "`/setlengkap Twilight Masquerade`",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    await update.message.reply_text(
+        f"⏳ Mengecek kelengkapan set *{esc(query_str)}*\\.\\.\\.",
+        parse_mode="MarkdownV2"
+    )
+
+    # ── Ambil total kartu dari API Pokémon TCG ────────────────────────────
+    total_api    = 0
+    set_name_api = query_str
+    try:
+        headers = {"X-Api-Key": POKEMON_TCG_API_KEY} if POKEMON_TCG_API_KEY else {}
+        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+            resp = await client.get(
+                "https://api.pokemontcg.io/v2/sets",
+                params={"q": f'name:"{query_str}"'},
+                headers=headers
+            )
+            resp.raise_for_status()
+            sets = resp.json().get("data", [])
+            if sets:
+                best = max(
+                    sets,
+                    key=lambda s: len(set(query_str.lower().split()) &
+                                      set(s["name"].lower().split()))
+                )
+                set_name_api = best["name"]
+                total_api    = best.get("total") or best.get("printedTotal") or 0
+    except Exception as e:
+        logger.warning(f"[setlengkap] API: {e}")
+
+    # ── Hitung dari inventory ──────────────────────────────────────────────
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT COUNT(*), COUNT(DISTINCT card_name)
+               FROM inventory
+               WHERE user_id=? AND (
+                 LOWER(card_set) LIKE LOWER(?) OR
+                 LOWER(card_name) LIKE LOWER(?)
+               )""",
+            (user_id, f"%{query_str}%", f"%{query_str}%")
+        ) as cur:
+            row = await cur.fetchone()
+        owned_count  = row[0] if row else 0
+        owned_unique = row[1] if row else 0
+
+        async with db.execute(
+            """SELECT card_name, psa_grade FROM inventory
+               WHERE user_id=? AND (
+                 LOWER(card_set) LIKE LOWER(?) OR
+                 LOWER(card_name) LIKE LOWER(?)
+               ) ORDER BY card_name""",
+            (user_id, f"%{query_str}%", f"%{query_str}%")
+        ) as cur:
+            owned_cards = await cur.fetchall()
+
+    # ── Build respons ──────────────────────────────────────────────────────
+    if total_api > 0:
+        pct        = min(100.0, (owned_unique / total_api) * 100)
+        bar_filled = int(pct / 5)
+        bar        = "█" * bar_filled + "░" * (20 - bar_filled)
+        status_e   = ("🏆" if pct >= 100 else "🎯" if pct >= 80
+                       else "📦" if pct >= 50 else "🌱")
+        missing    = max(0, total_api - owned_unique)
+        lines = [
+            f"{status_e} *Kelengkapan: {esc(set_name_api)}*\n",
+            f"📊 `{bar}` {pct:.1f}%\n",
+            f"🃏 Dimiliki: *{owned_unique}/{total_api}* unik "
+            f"\\({owned_count} total termasuk duplikat\\)\n",
+        ]
+        if pct >= 100:
+            lines.append("🎊 *Selamat\\! Set Lengkap\\!*\n")
+        else:
+            lines.append(f"❓ Kurang: *{missing}* kartu lagi\n")
+    else:
+        lines = [
+            f"📦 *Set: {esc(query_str)}*\n",
+            f"🃏 Kartu dimiliki: *{owned_count}* \\({owned_unique} unik\\)\n",
+            "_\\(Total kartu tidak diketahui — coba nama set lebih spesifik\\)_\n"
+        ]
+
+    if owned_cards:
+        lines.append("_Kartu yang dimiliki:_")
+        for name, grade in owned_cards[:20]:
+            g_str = f" \\[{esc(grade)}\\]" if grade else ""
+            lines.append(f"  ✅ {esc(name)}{g_str}")
+        if len(owned_cards) > 20:
+            lines.append(f"  _\\.\\.\\. dan {len(owned_cards) - 20} lagi_")
+    else:
+        lines.append("_Belum ada kartu dari set ini di inventorymu_")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── 4. /hargashopee — Link pencarian Shopee/Tokopedia ────────────────────────
+async def hargashopee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /hargashopee <nama kartu>   — buka link pencarian Shopee/Tokopedia
+    /hargashopee <id>           — dari nomor inventory
+    """
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/hargashopee Charizard VMAX`\n"
+            "atau: `/hargashopee 42` \\(no inventory\\)",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    raw       = " ".join(context.args).strip()
+    card_name = raw
+    card_set  = ""
+
+    if raw.isdigit():
+        inv_id = int(raw)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT card_name, card_set FROM inventory WHERE id=? AND user_id=?",
+                (inv_id, user_id)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text(
+                f"❌ Kartu \\#{inv_id} tidak ditemukan\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
+        card_name, card_set = row[0], row[1] or ""
+
+    search_q = f"{card_name} {card_set} pokemon card".strip()
+
+    shopee_url = (
+        "https://shopee.co.id/search?keyword="
+        + search_q.replace(" ", "+").replace("&", "%26")
+    )
+    tokped_url = (
+        "https://www.tokopedia.com/search?st=product&q="
+        + search_q.replace(" ", "%20").replace("&", "%26")
+    )
+    buka_url = (
+        "https://www.bukalapak.com/products?search[keywords]="
+        + search_q.replace(" ", "%20").replace("&", "%26")
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛍️ Shopee",    url=shopee_url)],
+        [InlineKeyboardButton("🟢 Tokopedia", url=tokped_url)],
+        [InlineKeyboardButton("🔴 Bukalapak", url=buka_url)],
+    ])
+
+    set_info = f"\n📦 Set: _{esc(card_set)}_" if card_set else ""
+    await update.message.reply_text(
+        f"🔍 *Cari Harga: {esc(card_name)}*{set_info}\n\n"
+        f"Pilih marketplace:",
+        parse_mode="MarkdownV2",
+        reply_markup=kb
+    )
+
+
+# ── 6. /bulkadd — Tambah banyak kartu sekaligus ──────────────────────────────
+async def bulkadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /bulkadd
+    Charizard VMAX
+    Pikachu V
+    Mewtwo EX
+    — tambah beberapa kartu sekaligus, satu nama per baris
+    """
+    user_id   = update.effective_user.id
+    full_text = update.message.text or ""
+
+    # ambil baris setelah perintah
+    parts = full_text.split("\n", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "⚠️ *Format /bulkadd:*\n\n"
+            "`/bulkadd`\n"
+            "`Charizard VMAX`\n"
+            "`Pikachu V`\n"
+            "`Mewtwo EX`\n\n"
+            "Satu nama kartu per baris \\(maks 20\\)\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    card_lines = [l.strip() for l in parts[1].split("\n") if l.strip()]
+    if not card_lines:
+        await update.message.reply_text(
+            "⚠️ Tidak ada nama kartu\\.", parse_mode="MarkdownV2"
+        )
+        return
+
+    if len(card_lines) > 20:
+        await update.message.reply_text(
+            f"⚠️ Maksimal 20 kartu sekaligus \\(kamu memasukkan {len(card_lines)}\\)\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    prog = await update.message.reply_text(
+        f"⏳ Memproses *{len(card_lines)}* kartu\\.\\.\\.",
+        parse_mode="MarkdownV2"
+    )
+
+    results_ok  = []
+    results_err = []
+    dup_warns   = []
+
+    for card_query in card_lines:
+        try:
+            card = await search_pokemon_card(card_query)
+            if not card or (isinstance(card, dict) and card.get("error")):
+                results_err.append(f"❌ {esc(card_query)}")
+                continue
+
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT COUNT(*) FROM inventory WHERE user_id=? AND LOWER(card_name)=LOWER(?)",
+                    (user_id, card["name"])
+                ) as cur:
+                    dup = (await cur.fetchone())[0]
+
+                await db.execute(
+                    "INSERT INTO inventory (user_id, card_name, card_set, price_usd, price_idr, condition)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (user_id, card["name"], card["set"], card["price_usd"], card["price_idr"], "Near Mint"),
+                )
+                await db.execute(
+                    "INSERT INTO price_history (user_id, card_name, card_set, price_usd, price_idr)"
+                    " VALUES (?,?,?,?,?)",
+                    (user_id, card["name"], card["set"], card["price_usd"], card["price_idr"]),
+                )
+                await db.commit()
+
+            price_str = esc_usd(card["price_usd"]) if card["price_usd"] > 0 else "N/A"
+            ok_line   = f"✅ {esc(card['name'])} — {price_str}"
+            if dup > 0:
+                ok_line += f" ⚠️ duplikat \\({dup}x\\)"
+                dup_warns.append(card["name"])
+            results_ok.append(ok_line)
+        except Exception as e:
+            results_err.append(f"❌ {esc(card_query)} \\(error\\)")
+            logger.error(f"[bulkadd] {card_query}: {e}")
+
+    lines = [
+        f"📦 *Bulk Add Selesai:*\n",
+        f"✅ Berhasil: *{len(results_ok)}/{len(card_lines)}*\n",
+    ]
+    if results_ok:
+        lines.append("*Berhasil:*")
+        lines.extend(results_ok[:15])
+        if len(results_ok) > 15:
+            lines.append(f"_\\.\\.\\. \\+{len(results_ok) - 15} lagi_")
+    if results_err:
+        lines.append("\n*Gagal:*")
+        lines.extend(results_err[:10])
+
+    try:
+        await prog.edit_text("\n".join(lines), parse_mode="MarkdownV2")
+    except Exception:
+        await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+
+
+# ── 7. /backupoto — Weekly auto backup DB ────────────────────────────────────
+async def backupoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /backupoto on   — aktifkan auto backup mingguan (Senin 07:00)
+    /backupoto off  — matikan
+    /backupoto      — cek status
+    """
+    user_id = update.effective_user.id
+    subcmd  = context.args[0].lower() if context.args else "status"
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (user_id,))
+        async with db.execute(
+            "SELECT backupoto_enabled, backupoto_chat_id FROM user_settings WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        enabled  = (row[0] or 0) if row else 0
+        chat_id  = row[1] if row else None
+
+        if subcmd == "on":
+            new_chat = update.effective_chat.id
+            await db.execute(
+                "UPDATE user_settings SET backupoto_enabled=1, backupoto_chat_id=? WHERE user_id=?",
+                (new_chat, user_id)
+            )
+            await db.commit()
+            await update.message.reply_text(
+                "✅ *Auto Backup Aktif\\!*\n\n"
+                "📤 Database JSON dikirim ke sini setiap *Senin 07:00*\\.\n"
+                "_/backupoto off untuk matikan_",
+                parse_mode="MarkdownV2"
+            )
+
+        elif subcmd == "off":
+            await db.execute(
+                "UPDATE user_settings SET backupoto_enabled=0 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+            await update.message.reply_text(
+                "❌ *Auto Backup Dimatikan\\.*\n"
+                "_/backupoto on untuk aktifkan lagi_",
+                parse_mode="MarkdownV2"
+            )
+
+        else:
+            st = "✅ Aktif" if enabled else "❌ Tidak aktif"
+            await update.message.reply_text(
+                f"📦 *Status Auto Backup:*\n\n"
+                f"Status: {st}\n"
+                f"Jadwal: Senin 07:00 WIB\n\n"
+                f"_/backupoto on untuk aktifkan_",
+                parse_mode="MarkdownV2"
+            )
+
+
+async def send_auto_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled job: kirim backup JSON mingguan ke semua user yang opt-in."""
+    logger.info("[backupoto] Running weekly backup job")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, backupoto_chat_id FROM user_settings WHERE backupoto_enabled=1"
+        ) as cur:
+            users = await cur.fetchall()
+
+    for user_id, chat_id in users:
+        if not chat_id:
+            chat_id = user_id
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT id, card_name, card_set, price_usd, price_idr, condition, psa_grade"
+                    " FROM inventory WHERE user_id=?", (user_id,)
+                ) as cur:
+                    inventory = [
+                        {"id": r[0], "card_name": r[1], "card_set": r[2],
+                         "price_usd": r[3], "price_idr": r[4],
+                         "condition": r[5], "psa_grade": r[6]}
+                        for r in await cur.fetchall()
+                    ]
+                async with db.execute(
+                    "SELECT id, card_name, card_set, price_usd, price_idr"
+                    " FROM wishlist WHERE user_id=?", (user_id,)
+                ) as cur:
+                    wishlist = [
+                        {"id": r[0], "card_name": r[1], "card_set": r[2],
+                         "price_usd": r[3], "price_idr": r[4]}
+                        for r in await cur.fetchall()
+                    ]
+
+            total_usd   = sum(r["price_usd"] or 0 for r in inventory)
+            backup_data = {
+                "backup_info": {
+                    "user_id":     user_id,
+                    "backup_at":   datetime.now().isoformat(),
+                    "type":        "auto_weekly",
+                    "version":     "v12",
+                    "total_cards": len(inventory),
+                    "total_usd":   round(total_usd, 2),
+                    "total_idr":   round(total_usd * EXCHANGE_RATE, 0),
+                },
+                "inventory": inventory,
+                "wishlist":  wishlist,
+            }
+
+            buf = io.BytesIO(json.dumps(backup_data, ensure_ascii=False, indent=2).encode())
+            buf.name = f"backup_auto_{user_id}_{datetime.now().strftime('%Y%m%d')}.json"
+
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=buf,
+                caption=(
+                    f"📦 *Auto Backup Mingguan*\n"
+                    f"📅 {datetime.now().strftime('%d %b %Y')}\n"
+                    f"🃏 {len(inventory)} kartu | 💵 ${total_usd:.2f}"
+                ),
+                parse_mode="Markdown"
+            )
+            logger.info(f"[backupoto] sent to user {user_id}")
+        except Exception as e:
+            logger.error(f"[backupoto] error user {user_id}: {e}")
+
+
+# ── 8. /marketplace — Multi-platform marketplace links ───────────────────────
+async def marketplace_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /marketplace <nama kartu>   — link marketplace multi-platform
+    /marketplace <id>           — dari no inventory
+    """
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Format: `/marketplace Charizard VMAX`\n"
+            "atau: `/marketplace 42` \\(no inventory\\)",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    raw       = " ".join(context.args).strip()
+    card_name = raw
+    card_set  = ""
+    grade_str = ""
+
+    if raw.isdigit():
+        inv_id = int(raw)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT card_name, card_set, psa_grade FROM inventory WHERE id=? AND user_id=?",
+                (inv_id, user_id)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await update.message.reply_text(
+                f"❌ Kartu \\#{inv_id} tidak ditemukan\\.",
+                parse_mode="MarkdownV2"
+            )
+            return
+        card_name = row[0]
+        card_set  = row[1] or ""
+        grade_str = row[2] or ""
+
+    base_q = f"{card_name} {card_set}".strip()
+    full_q = f"{base_q} {grade_str}".strip() if grade_str else base_q
+
+    def enc(s: str) -> str:
+        return s.replace(" ", "%20").replace("&", "%26").replace("#", "%23")
+
+    shopee_url    = (
+        "https://shopee.co.id/search?keyword="
+        + full_q.replace(" ", "+").replace("&", "%26") + "+pokemon"
+    )
+    tokped_url    = (
+        "https://www.tokopedia.com/search?st=product&q="
+        + enc(full_q) + "+pokemon"
+    )
+    buka_url      = (
+        "https://www.bukalapak.com/products?search[keywords]="
+        + enc(full_q) + "+pokemon"
+    )
+    ebay_url      = (
+        "https://www.ebay.com/sch/i.html?_nkw="
+        + full_q.replace(" ", "+") + "+pokemon+card"
+    )
+    tcgplayer_url = (
+        "https://www.tcgplayer.com/search/pokemon/product?q="
+        + enc(card_name)
+    )
+    cardmarket_url = (
+        "https://www.cardmarket.com/en/Pokemon/Products/Search?searchString="
+        + enc(card_name)
+    )
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🛍️ Shopee",    url=shopee_url),
+            InlineKeyboardButton("🟢 Tokopedia", url=tokped_url),
+        ],
+        [
+            InlineKeyboardButton("🔴 Bukalapak", url=buka_url),
+            InlineKeyboardButton("🌐 eBay",       url=ebay_url),
+        ],
+        [
+            InlineKeyboardButton("📊 TCGPlayer",   url=tcgplayer_url),
+            InlineKeyboardButton("🇪🇺 CardMarket",  url=cardmarket_url),
+        ],
+    ])
+
+    grade_info = f"\n🏆 Grade: {esc(grade_str)}" if grade_str else ""
+    set_info   = f"\n📦 Set: {esc(card_set)}" if card_set else ""
+
+    await update.message.reply_text(
+        f"🛒 *Cari di Marketplace:*\n\n"
+        f"🃏 *{esc(card_name)}*{set_info}{grade_info}\n\n"
+        f"Pilih marketplace di bawah:",
+        parse_mode="MarkdownV2",
+        reply_markup=kb
+    )
+
+
 def main() -> None:
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
@@ -7467,14 +8375,33 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(setgrade_grader_cb, pattern=r"^setgrade_grader:"))
     app.add_handler(CallbackQueryHandler(setgrade_nilai_cb,  pattern=r"^setgrade_nilai:"))
 
+    # v12 — Trade, GradedAlert, SetLengkap, Hargashopee, BulkAdd, BackupOto, Marketplace
+    app.add_handler(CommandHandler("tradeoffer",   tradeoffer_cmd))
+    app.add_handler(CommandHandler("myoffers",     myoffers_cmd))
+    app.add_handler(CommandHandler("tradematches", tradematches_cmd))
+    app.add_handler(CommandHandler("removeoffer",  removeoffer_cmd))
+    app.add_handler(CommandHandler("gradedalert",  gradedalert_cmd))
+    app.add_handler(CommandHandler("setlengkap",   setlengkap_cmd))
+    app.add_handler(CommandHandler("hargashopee",  hargashopee_cmd))
+    app.add_handler(CommandHandler("bulkadd",      bulkadd_cmd))
+    app.add_handler(CommandHandler("backupoto",    backupoto_cmd))
+    app.add_handler(CommandHandler("marketplace",  marketplace_cmd))
+
     # Background jobs
     jq = app.job_queue
-    jq.run_repeating(auto_snapshot_all,  interval=86400, first=60)    # snapshot harian
-    jq.run_repeating(check_reminders,    interval=3600,  first=120)   # cek reminder tiap jam
+    jq.run_repeating(auto_snapshot_all,       interval=86400, first=60)    # snapshot harian
+    jq.run_repeating(check_reminders,         interval=3600,  first=120)   # cek reminder tiap jam
+    jq.run_repeating(check_graded_prices_job, interval=86400, first=300)   # cek harga graded tiap hari
     # Laporan harian pukul 08:00 (UTC+7 = 01:00 UTC)
     jq.run_daily(send_daily_report, time=__import__("datetime").time(1, 0, 0))
+    # Auto backup mingguan: Senin 00:00 UTC (07:00 WIB)
+    jq.run_daily(
+        send_auto_backup_job,
+        time=__import__("datetime").time(0, 0, 0),
+        days=(0,),  # Senin
+    )
 
-    logger.info("Bot Pokémon Vision & Portfolio v11 aktif! (+autorefresh, folder, infolder, pl, hitunggrade)")
+    logger.info("Bot Pokémon Vision & Portfolio v12 aktif! (+tradeoffer, gradedalert, setlengkap, hargashopee, bulkadd, backupoto, marketplace, duplikat-warn)")
     app.run_polling()
 
 if __name__ == "__main__":
