@@ -1433,7 +1433,7 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
         usd_str   = esc_usd(p_usd)   if (p_usd  or 0) > 0 else "N/A"
         idr_str   = f"Rp {p_idr:,.0f}" if (p_idr or 0) > 0 else "N/A"
         cond_str  = esc(condition or "Near Mint")
-        grade_str = f" \\| 🏆 PSA {esc(str(psa_grade))}" if psa_grade else ""
+        grade_str = f" \\| 🏆 {esc(str(psa_grade))}" if psa_grade else ""
         photo_str = f" \\| 📷 /photo {inv_id}" if photo_file_id else ""
         set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
         sale_str  = f" \\| 🏷️ _{esc_usd(ask_price or 0)}_" if for_sale else ""
@@ -2375,13 +2375,72 @@ async def set_condition(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 # ── /setgrade ─────────────────────────────────────────────────────────────────
+# Grade valid: PSA 1-10 (bulat), BGS/CGC 1-10 (step 0.5)
+_VALID_GRADERS = ["PSA", "BGS", "CGC"]
+_GRADER_EMOJI  = {"PSA": "🏆", "BGS": "🎖", "CGC": "🥇"}
+
+def _valid_grade_values(grader: str) -> list[str]:
+    """Return daftar nilai grade valid untuk grader tertentu."""
+    if grader == "PSA":
+        return [str(i) for i in range(1, 11)]          # 1–10 bulat
+    else:  # BGS / CGC
+        vals = []
+        v = 1.0
+        while v <= 10.0:
+            vals.append(str(int(v)) if v == int(v) else str(v))
+            v = round(v + 0.5, 1)
+        return vals
+
+def _parse_grade_direct(args: list[str]) -> tuple[str, str] | None:
+    """
+    Parse args menjadi (grader, nilai) dari input langsung.
+    Contoh: ["PSA", "10"] → ("PSA", "10")
+            ["BGS", "9.5"] → ("BGS", "9.5")
+    Return None kalau format tidak valid.
+    """
+    if len(args) < 2:
+        return None
+    grader = args[0].upper()
+    if grader not in _VALID_GRADERS:
+        return None
+    nilai = args[1]
+    valid = _valid_grade_values(grader)
+    if nilai not in valid:
+        return None
+    return (grader, nilai)
+
+def _build_setgrade_grader_kb(db_id: int) -> InlineKeyboardMarkup:
+    """Keyboard pilih grader."""
+    buttons = [
+        InlineKeyboardButton(f"{_GRADER_EMOJI[g]} {g}", callback_data=f"setgrade_grader:{db_id}:{g}")
+        for g in _VALID_GRADERS
+    ]
+    return InlineKeyboardMarkup([
+        buttons,
+        [InlineKeyboardButton("❌ Hapus Grade", callback_data=f"setgrade_grader:{db_id}:HAPUS")],
+    ])
+
+def _build_setgrade_nilai_kb(db_id: int, grader: str) -> InlineKeyboardMarkup:
+    """Keyboard pilih nilai grade setelah grader dipilih."""
+    vals  = _valid_grade_values(grader)
+    rows  = []
+    chunk = 5
+    for i in range(0, len(vals), chunk):
+        rows.append([
+            InlineKeyboardButton(v, callback_data=f"setgrade_nilai:{db_id}:{grader}:{v}")
+            for v in vals[i:i + chunk]
+        ])
+    rows.append([InlineKeyboardButton("◀️ Kembali", callback_data=f"setgrade_grader:{db_id}:BACK")])
+    return InlineKeyboardMarkup(rows)
+
 async def set_grade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
-    if len(context.args) < 2:
+    if not context.args:
         await update.message.reply_text(
-            "⚠️ Format: `/setgrade \\[no\\] \\[grade\\]`\n"
-            "Contoh: `/setgrade 1 PSA 10`",
+            "⚠️ Format: `/setgrade \\[no\\]` atau `/setgrade \\[no\\] \\[PSA/BGS/CGC\\] \\[nilai\\]`\n"
+            "Contoh: `/setgrade 1` • `/setgrade 2 PSA 10` • `/setgrade 3 BGS 9\\.5`\n"
+            "Hapus grade: `/setgrade 1 hapus`",
             parse_mode="MarkdownV2"
         )
         return
@@ -2392,20 +2451,142 @@ async def set_grade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⚠️ Nomor harus angka\\!", parse_mode="MarkdownV2")
         return
 
-    grade = " ".join(context.args[1:]).strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_name, psa_grade FROM inventory WHERE user_id=? ORDER BY id", (user_id,)
+        ) as cur:
+            items = await cur.fetchall()
+
+    if idx < 1 or idx > len(items):
+        await update.message.reply_text("❌ Nomor tidak ditemukan\\.", parse_mode="MarkdownV2")
+        return
+
+    db_id, card_name, current_grade = items[idx - 1]
+    current_str = f" \\(sekarang: *{esc(current_grade)}*\\)" if current_grade else ""
+
+    rest = context.args[1:]
+
+    # ── mode hapus ────────────────────────────────────────────────────────────
+    if rest and rest[0].lower() in ("hapus", "remove", "-", "none"):
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE inventory SET psa_grade=NULL WHERE id=?", (db_id,))
+            await db.commit()
+        await update.message.reply_text(
+            f"🗑️ Grade *{esc(card_name)}* dihapus\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # ── mode langsung: /setgrade 1 PSA 10 ────────────────────────────────────
+    if len(rest) >= 2:
+        parsed = _parse_grade_direct(rest)
+        if parsed is None:
+            valid_psa = "1\\-10"
+            valid_bgs = "1\\-10 \\(step 0\\.5\\)"
+            await update.message.reply_text(
+                f"❌ Format grade tidak valid\\!\n"
+                f"• PSA: `/setgrade {idx} PSA 10` \\(angka {valid_psa}\\)\n"
+                f"• BGS: `/setgrade {idx} BGS 9\\.5` \\(angka {valid_bgs}\\)\n"
+                f"• CGC: `/setgrade {idx} CGC 9` \\(angka {valid_bgs}\\)",
+                parse_mode="MarkdownV2"
+            )
+            return
+        grader, nilai = parsed
+        grade_str = f"{grader} {nilai}"
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE inventory SET psa_grade=? WHERE id=?", (grade_str, db_id))
+            await db.commit()
+        emoji = _GRADER_EMOJI.get(grader, "🏆")
+        await update.message.reply_text(
+            f"{emoji} Grade *{esc(card_name)}* → *{esc(grade_str)}*",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # ── mode inline keyboard: /setgrade 1 ────────────────────────────────────
+    await update.message.reply_text(
+        f"🏆 Set grade untuk *{esc(card_name)}*{current_str}\nPilih lembaga grading:",
+        reply_markup=_build_setgrade_grader_kb(db_id),
+        parse_mode="MarkdownV2"
+    )
+
+
+async def setgrade_grader_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: user memilih grader atau tombol Kembali/Hapus."""
+    query = update.callback_query
+    await query.answer()
+    _, db_id_str, grader = query.data.split(":", 2)
+    db_id   = int(db_id_str)
+    user_id = query.from_user.id
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, card_name FROM inventory WHERE user_id=? ORDER BY id", (user_id,)) as cur:
-            items = await cur.fetchall()
-        if idx < 1 or idx > len(items):
-            await update.message.reply_text("❌ Nomor tidak ditemukan\\.", parse_mode="MarkdownV2")
+        async with db.execute(
+            "SELECT card_name, psa_grade FROM inventory WHERE id=? AND user_id=?", (db_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await query.edit_message_text("❌ Kartu tidak ditemukan\\.", parse_mode="MarkdownV2")
+        return
+
+    card_name, current_grade = row
+    current_str = f" \\(sekarang: *{esc(current_grade)}*\\)" if current_grade else ""
+
+    if grader == "BACK":
+        await query.edit_message_text(
+            f"🏆 Set grade untuk *{esc(card_name)}*{current_str}\nPilih lembaga grading:",
+            reply_markup=_build_setgrade_grader_kb(db_id),
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    if grader == "HAPUS":
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE inventory SET psa_grade=NULL WHERE id=?", (db_id,))
+            await db.commit()
+        await query.edit_message_text(
+            f"🗑️ Grade *{esc(card_name)}* dihapus\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    emoji = _GRADER_EMOJI.get(grader, "🏆")
+    await query.edit_message_text(
+        f"{emoji} *{esc(grader)}* — Pilih nilai grade untuk *{esc(card_name)}*:",
+        reply_markup=_build_setgrade_nilai_kb(db_id, grader),
+        parse_mode="MarkdownV2"
+    )
+
+
+async def setgrade_nilai_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: user memilih nilai grade."""
+    query = update.callback_query
+    await query.answer()
+    _, db_id_str, grader, nilai = query.data.split(":", 3)
+    db_id   = int(db_id_str)
+    user_id = query.from_user.id
+
+    # Validasi sekali lagi di server side
+    if nilai not in _valid_grade_values(grader):
+        await query.answer("❌ Nilai tidak valid!", show_alert=True)
+        return
+
+    grade_str = f"{grader} {nilai}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_name FROM inventory WHERE id=? AND user_id=?", (db_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await query.edit_message_text("❌ Kartu tidak ditemukan\\.", parse_mode="MarkdownV2")
             return
-        db_id, card_name = items[idx - 1]
-        await db.execute("UPDATE inventory SET psa_grade=? WHERE id=?", (grade, db_id))
+        card_name = row[0]
+        await db.execute("UPDATE inventory SET psa_grade=? WHERE id=?", (grade_str, db_id))
         await db.commit()
 
-    await update.message.reply_text(
-        f"🏆 Grade *{esc(card_name)}* → *{esc(grade)}*",
+    emoji = _GRADER_EMOJI.get(grader, "🏆")
+    await query.edit_message_text(
+        f"{emoji} Grade *{esc(card_name)}* → *{esc(grade_str)}* ✅",
         parse_mode="MarkdownV2"
     )
 
@@ -3407,7 +3588,7 @@ async def cari_lokal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"*📦 Inventory Kamu \\({len(inv_rows)} kartu\\):*")
         for inv_id, name, card_set, p_usd, p_idr, condition, psa_grade, photo_file_id in inv_rows:
             usd_str   = f"{esc_usd(p_usd)}" if p_usd > 0 else "N/A"
-            grade_str = f" \\| PSA {esc(psa_grade)}" if psa_grade else ""
+            grade_str = f" \\| 🏆 {esc(psa_grade)}" if psa_grade else ""
             photo_str = " 📷" if photo_file_id else ""
             set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
             lines.append(
@@ -4621,7 +4802,7 @@ def _generate_share_image(
     if condition:
         info_parts.append(condition)
     if psa_grade:
-        info_parts.append(f"PSA {psa_grade}")
+        info_parts.append(f"🏆 {psa_grade}")
     if info_parts:
         chip_text = "  ".join(info_parts)
         draw.text((30, 222), chip_text, fill=(80, 220, 120), font=f_sm)
@@ -4681,7 +4862,7 @@ async def share_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if card_set:
             caption_parts.append(f"📦 {card_set}")
         if psa_grade:
-            caption_parts.append(f"🏆 PSA {psa_grade}")
+            caption_parts.append(f"🏆 {psa_grade}")
         caption_parts.append(f"💵 ${price_usd:.2f} | Rp {price_idr:,.0f}")
         caption = "\n".join(caption_parts)
 
@@ -5121,7 +5302,7 @@ async def listing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Hashtags
     name_slug  = re.sub(r'[^a-zA-Z0-9]', '', card_name.lower())
     set_slug   = re.sub(r'[^a-zA-Z0-9]', '', (card_set or "").lower())
-    grade_line = f"🏆 Grade: PSA {esc(psa_grade)} \\(card sudah di\\-grading PSA\\!\\)\n" if psa_grade else ""
+    grade_line = f"🏆 Grade: {esc(psa_grade)} \\(card sudah di\\-grading\\!\\)\n" if psa_grade else ""
     tag_line   = f"🔖 Label: {esc(tags)}\n" if tags else ""
     set_line   = f"📦 Set: {esc(card_set)}\n" if card_set else ""
 
@@ -5140,7 +5321,7 @@ async def listing_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"Minat? Chat WA/Telegram dulu ya\\!\n\n"
         f"\\#{esc(name_slug)} \\#pokemontcg \\#jualpokemon \\#pokemon"
         + (f" \\#{esc(set_slug)}" if set_slug else "")
-        + (f" \\#psa{esc(psa_grade.replace(' ',''))}" if psa_grade else "")
+        + (f" \\#{esc(psa_grade.lower().replace(' ',''))}" if psa_grade else "")
     )
 
     await update.message.reply_text(
@@ -5193,7 +5374,7 @@ def _build_pdf_bytes(cards: list, username: str) -> bytes:
             f"${p_usd:.2f}" if p_usd else "-",
             f"Rp{int(p_idr):,}" if p_idr else "-",
             (cond or "NM")[:12],
-            (f"PSA {grade}" if grade else "-")[:8],
+            (grade if grade else "-")[:10],
         ]
         for w, d in zip(col_widths, row_data):
             pdf.cell(w, 6, d, border=1, fill=True)
@@ -5629,7 +5810,7 @@ async def salejual_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     for inv_id, name, card_set, buy_usd, price_usd, ask_p, cond, grade, notes in rows:
         set_str   = f" \\({esc(card_set)}\\)" if card_set else ""
-        grade_str = f" \\| PSA {esc(str(grade))}" if grade else ""
+        grade_str = f" \\| 🏆 {esc(str(grade))}" if grade else ""
         base_usd  = buy_usd or price_usd or 0
         profit    = (ask_p or 0) - base_usd
         sign_p    = "\\+" if profit >= 0 else ""
@@ -6182,8 +6363,8 @@ async def tradein_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     s1_str  = f" \\({esc(s1)}\\)" if s1 else ""
     s2_str  = f" \\({esc(s2)}\\)" if s2 else ""
-    g1_str  = f" \\| PSA {esc(str(g1))}" if g1 else ""
-    g2_str  = f" \\| PSA {esc(str(g2))}" if g2 else ""
+    g1_str  = f" \\| 🏆 {esc(str(g1))}" if g1 else ""
+    g2_str  = f" \\| 🏆 {esc(str(g2))}" if g2 else ""
 
     msg = (
         f"🔄 *SIMULASI TRADE\\-IN*\n\n"
@@ -6426,7 +6607,7 @@ async def qr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caption = (
         f"🔳 QR Code: {name}{set_str}\n"
         f"💵 ${price_usd:.2f}  |  {cond}"
-        + (f"\n🎓 PSA {grade}" if grade else "")
+        + (f"\n🏆 {grade}" if grade else "")
     )
     await update.message.reply_photo(photo=buf, caption=caption)
 
@@ -6462,7 +6643,7 @@ async def katalog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         cards_html_parts = []
         for inv_id, name, card_set, price_usd, price_idr, cond, grade, tags in rows:
             grade_badge = (
-                f'<span class="badge psa">PSA {grade}</span>' if grade else ""
+                f'<span class="badge psa">🏆 {grade}</span>' if grade else ""
             )
             set_html  = f'<div class="card-set">{card_set or "—"}</div>'
             tags_html = f'<div class="tags">🔖 {tags}</div>' if tags else ""
@@ -6874,7 +7055,7 @@ async def infolder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     total = sum(r[4] or 0 for r in rows)
     lines = [f"{em} *Folder {esc(folder_name)}* \\({len(rows)} kartu\\)\n"]
     for (cid, name, cset, cond, price_usd, grade) in rows:
-        grade_str = f" \\| PSA *{esc(str(grade))}*" if grade else ""
+        grade_str = f" \\| 🏆 *{esc(str(grade))}*" if grade else ""
         lines.append(f"\\[{cid}\\] *{esc(name)}* — {esc_usd(price_usd or 0)}{grade_str}")
     lines.append(f"\n💰 *Total: {esc_usd(total)}*")
     lines.append(f"_/folder \\<id\\> \\<nama\\> untuk pindah kartu_")
@@ -7281,6 +7462,10 @@ def main() -> None:
     app.add_handler(CommandHandler("pl",           pl_cmd))
     app.add_handler(CommandHandler("hitunggrade",  hitunggrade_cmd))
     app.add_handler(CallbackQueryHandler(folder_set_cb, pattern=r"^folder_set:"))
+
+    # setgrade inline keyboard callbacks
+    app.add_handler(CallbackQueryHandler(setgrade_grader_cb, pattern=r"^setgrade_grader:"))
+    app.add_handler(CallbackQueryHandler(setgrade_nilai_cb,  pattern=r"^setgrade_nilai:"))
 
     # Background jobs
     jq = app.job_queue
