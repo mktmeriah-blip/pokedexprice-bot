@@ -1456,7 +1456,8 @@ async def _build_inventory_page(user_id: int, page: int) -> tuple:
             f"\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\n"
             f"💰 *Total: {esc_usd(total_usd)} \\| Rp {total_idr:,.0f}* \\({total} kartu\\)\n\n"
             f"_/note \\[id\\] \\[teks\\] • /forsale \\[id\\] \\[harga\\]_\n"
-            f"_/listing /tag /remind /share /setphoto /editkartu_"
+            f"_/listing /tag /remind /share /setphoto /editkartu_\n"
+            f"_/setgrade \\[id\\] \\[grade\\] • /setcondition \\[id\\] \\[kondisi\\]_"
         )
 
     return "\n".join(lines), page, total_pages, total
