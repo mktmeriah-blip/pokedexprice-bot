@@ -873,7 +873,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🏷️ *KONDISI KARTU*\n"
         "Mint/NM: 100% \\| LP: 80% \\| MP: 65%\n"
-        "HP: 50% \\| Damaged: 25%",
+        "HP: 50% \\| Damaged: 25%\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🆕 *FITUR v11*\n"
+        "• `/autorefresh on` → Auto\\-refresh harga tiap hari jam 10\\.00 WIB\n"
+        "• `/autorefresh off` → Matikan auto\\-refresh\n"
+        "• `/autorefresh status` → Cek status auto\\-refresh\n\n"
+        "📂 *FOLDER KOLEKSI*\n"
+        "• `/folder` → Lihat semua folder & nilai per folder\n"
+        "• `/folder <id>` → Pindah kartu via tombol keyboard\n"
+        "• `/folder <id> <nama>` → Langsung pindah folder\n"
+        "• `/infolder Graded` → Lihat kartu di folder tertentu\n"
+        "Folder: 🏠 Pribadi · 🏷️ Dijual · 🏆 Graded · 🔄 Trade · 🖼️ Display\n\n"
+        "📊 *LAPORAN P&L*\n"
+        "• `/pl` → Laporan profit/loss bulan ini\n"
+        "• `/pl Oktober` → P&L bulan spesifik\n"
+        "• `/pl 10 2025` → P&L bulan & tahun spesifik\n\n"
+        "🎓 *WORTH GRADING*\n"
+        "• `/hitunggrade Charizard Base Set` → Kalkulasi worth grading\n"
+        "• `/hitunggrade id:5` → Dari kartu di inventory\n"
+        "Tampil: estimasi nilai PSA 7/8/9/10, biaya grading, break\\-even & rekomendasi",
         parse_mode="MarkdownV2",
     )
 
